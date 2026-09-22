@@ -7,9 +7,16 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	type ImageContent,
+	type TextContent,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@step-harness/providers";
+import {
+	truncateStringToBytesFromEnd,
+	truncateStringToBytesFromStart,
+	utf8ByteLength,
+} from "./harness/utils/truncate.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AgentContext,
@@ -24,6 +31,82 @@ import type {
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+/**
+ * Default cap on the combined byte size of text content blocks in a tool result,
+ * applied just before the result is turned into a `ToolResultMessage` and persisted
+ * to session history. Built-in tools already cap their own output well below this
+ * (see DEFAULT_MAX_BYTES in harness/utils/truncate.ts), so this default leaves
+ * built-in tool output unaffected; it exists to bound extension/MCP/custom tool
+ * results, which have no cap of their own otherwise.
+ */
+export const DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024; // 128KB
+
+const TOOL_RESULT_HEAD_FRACTION = 0.8;
+
+function buildToolResultElisionMarker(toolName: string, originalBytes: number, maxBytes: number): string {
+	return `\n\n[... tool result truncated: "${toolName}" returned ${originalBytes} bytes, exceeding the ${maxBytes}-byte cap. Showing the beginning and end; the middle is elided. Re-call ${toolName} with narrower arguments or pagination to see the rest. ...]\n\n`;
+}
+
+/**
+ * Caps the combined byte size of text content blocks in a tool result.
+ *
+ * This is the single chokepoint that bounds every tool result - built-in, extension,
+ * MCP, or custom - before it enters session history and gets re-sent on every
+ * subsequent turn. Only text blocks are measured/trimmed; image blocks pass through
+ * untouched.
+ *
+ * `maxToolResultBytes` semantics: `undefined` applies the default cap
+ * (`DEFAULT_MAX_TOOL_RESULT_BYTES`); `0` (or any other non-positive value)
+ * explicitly disables capping; a positive number uses that cap.
+ */
+function capToolResultContent(
+	content: (TextContent | ImageContent)[],
+	toolName: string,
+	maxToolResultBytes: number | undefined,
+): (TextContent | ImageContent)[] {
+	const effectiveMaxBytes = maxToolResultBytes === undefined ? DEFAULT_MAX_TOOL_RESULT_BYTES : maxToolResultBytes;
+	if (!effectiveMaxBytes || effectiveMaxBytes <= 0) return content;
+
+	const textIndices: number[] = [];
+	let totalTextBytes = 0;
+	for (let i = 0; i < content.length; i++) {
+		const block = content[i];
+		if (block.type === "text") {
+			textIndices.push(i);
+			totalTextBytes += utf8ByteLength(block.text);
+		}
+	}
+	if (textIndices.length === 0 || totalTextBytes <= effectiveMaxBytes) {
+		return content;
+	}
+
+	const combinedText = textIndices.map((i) => (content[i] as TextContent).text).join("\n");
+	const marker = buildToolResultElisionMarker(toolName, totalTextBytes, effectiveMaxBytes);
+	const markerBytes = utf8ByteLength(marker);
+	const budget = Math.max(0, effectiveMaxBytes - markerBytes);
+	const headBudget = Math.ceil(budget * TOOL_RESULT_HEAD_FRACTION);
+	const tailBudget = budget - headBudget;
+
+	const head = truncateStringToBytesFromStart(combinedText, headBudget);
+	const tail = tailBudget > 0 ? truncateStringToBytesFromEnd(combinedText, tailBudget) : "";
+	const cappedText = head + marker + tail;
+
+	const firstTextIndex = textIndices[0];
+	const result: (TextContent | ImageContent)[] = [];
+	for (let i = 0; i < content.length; i++) {
+		const block = content[i];
+		if (block.type !== "text") {
+			result.push(block);
+			continue;
+		}
+		if (i === firstTextIndex) {
+			result.push({ type: "text", text: cappedText });
+		}
+		// Other text blocks are dropped; their content is already folded into cappedText.
+	}
+	return result;
+}
 
 /**
  * Start an agent loop with a new prompt message.
@@ -242,7 +325,7 @@ async function runLoop(
 				// them all instead of executing potentially borked calls.
 				const executedToolBatch =
 					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+						? await failToolCallsFromTruncatedMessage(toolCalls, config, emit)
 						: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
@@ -417,6 +500,7 @@ async function streamAssistantResponse(
  */
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
+	config: AgentLoopConfig,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
@@ -435,7 +519,7 @@ async function failToolCallsFromTruncatedMessage(
 			isError: true,
 		};
 		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = createToolResultMessage(finalized, config.maxToolResultBytes);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
@@ -507,7 +591,7 @@ async function executeToolCallsSequential(
 		}
 
 		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = createToolResultMessage(finalized, config.maxToolResultBytes);
 		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
@@ -579,7 +663,7 @@ async function executeToolCallsParallel(
 	);
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
-		const toolResultMessage = createToolResultMessage(finalized);
+		const toolResultMessage = createToolResultMessage(finalized, config.maxToolResultBytes);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
@@ -811,14 +895,19 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 	});
 }
 
-function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+function createToolResultMessage(
+	finalized: FinalizedToolCallOutcome,
+	maxToolResultBytes: number | undefined,
+): ToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
 		toolName: finalized.toolCall.name,
 		// Untyped tools (JS extensions) can return results without content; normalize
-		// so the null never enters session history or provider payloads.
-		content: finalized.result.content ?? [],
+		// so the null never enters session history or provider payloads. Cap the
+		// resulting text so oversized extension/MCP/custom results never enter
+		// session history or get re-sent on every subsequent turn.
+		content: capToolResultContent(finalized.result.content ?? [], finalized.toolCall.name, maxToolResultBytes),
 		details: finalized.result.details,
 		usage: finalized.result.usage,
 		...(finalized.result.addedToolNames?.length ? { addedToolNames: finalized.result.addedToolNames } : {}),

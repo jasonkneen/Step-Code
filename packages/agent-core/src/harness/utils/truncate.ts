@@ -51,7 +51,7 @@ interface RuntimeBuffer {
 const runtimeBuffer = (globalThis as { Buffer?: RuntimeBuffer }).Buffer;
 const nonAsciiPattern = /[^\x00-\x7f]/;
 
-function utf8ByteLength(content: string): number {
+export function utf8ByteLength(content: string): number {
 	if (runtimeBuffer) return runtimeBuffer.byteLength(content, "utf8");
 
 	const firstNonAscii = content.search(nonAsciiPattern);
@@ -295,10 +295,51 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 }
 
 /**
+ * Truncate a string to fit within a byte limit (from the start).
+ * Handles multi-byte UTF-8 characters correctly; never splits a surrogate pair.
+ */
+export function truncateStringToBytesFromStart(str: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+
+	let outputBytes = 0;
+	let end = 0;
+	let needsReplacement = false;
+	for (let i = 0; i < str.length; ) {
+		const code = str.charCodeAt(i);
+		let characterEnd = i + 1;
+		let characterBytes: number;
+		let unpairedSurrogate = false;
+		if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+			const next = str.charCodeAt(i + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) {
+				characterEnd = i + 2;
+				characterBytes = 4;
+			} else {
+				characterBytes = 3;
+				unpairedSurrogate = true;
+			}
+		} else if (code >= 0xd800 && code <= 0xdfff) {
+			characterBytes = 3;
+			unpairedSurrogate = true;
+		} else {
+			characterBytes = code <= 0x7f ? 1 : code <= 0x7ff ? 2 : 3;
+		}
+		if (outputBytes + characterBytes > maxBytes) break;
+		outputBytes += characterBytes;
+		end = characterEnd;
+		needsReplacement ||= unpairedSurrogate;
+		i = characterEnd;
+	}
+
+	const output = str.slice(0, end);
+	return needsReplacement ? replaceUnpairedSurrogates(output) : output;
+}
+
+/**
  * Truncate a string to fit within a byte limit (from the end).
  * Handles multi-byte UTF-8 characters correctly.
  */
-function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
+export function truncateStringToBytesFromEnd(str: string, maxBytes: number): string {
 	if (maxBytes <= 0) return "";
 
 	let outputBytes = 0;

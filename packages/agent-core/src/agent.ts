@@ -120,6 +120,8 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	toolExecution?: ToolExecutionMode;
+	/** See {@link AgentLoopConfig.maxToolResultBytes}. */
+	maxToolResultBytes?: number;
 }
 
 class PendingMessageQueue {
@@ -212,6 +214,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/** See {@link AgentLoopConfig.maxToolResultBytes}. */
+	public maxToolResultBytes?: number;
 
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
@@ -235,6 +239,7 @@ export class Agent {
 		this.transport = runtimeOptions.transport ?? "auto";
 		this.maxRetryDelayMs = runtimeOptions.maxRetryDelayMs;
 		this.toolExecution = runtimeOptions.toolExecution ?? "parallel";
+		this.maxToolResultBytes = runtimeOptions.maxToolResultBytes;
 	}
 
 	/**
@@ -457,6 +462,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			maxToolResultBytes: this.maxToolResultBytes,
 			shouldStopAfterTurn: shouldStopAfterTurn
 				? async (context) => await shouldStopAfterTurn(context, this.signal)
 				: undefined,

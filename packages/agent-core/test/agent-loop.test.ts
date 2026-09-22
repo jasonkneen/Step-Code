@@ -8,7 +8,7 @@ import {
 } from "@step-harness/providers";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, DEFAULT_MAX_TOOL_RESULT_BYTES } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
@@ -1728,5 +1728,111 @@ describe("tool-call markup leak retry", () => {
 		expect(executed).toEqual(["hi"]);
 		// Two model calls: tool turn + final turn, no leak retry in between.
 		expect(calls()).toBe(2);
+	});
+});
+
+describe("tool result capping", () => {
+	const bigToolSchema = Type.Object({});
+
+	function createBigTool(text: string): AgentTool<typeof bigToolSchema, Record<string, never>> {
+		return {
+			name: "big",
+			label: "Big",
+			description: "Returns a big result",
+			parameters: bigToolSchema,
+			async execute() {
+				return { content: [{ type: "text", text }], details: {} };
+			},
+		};
+	}
+
+	function scriptToolCallThenDone(toolName: string) {
+		let callIndex = 0;
+		return () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[{ type: "toolCall", id: "tool-1", name: toolName, arguments: {} }],
+						"toolUse",
+					);
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+				}
+				callIndex++;
+			});
+			return stream;
+		};
+	}
+
+	it("caps an oversized tool result text at message_end and preserves isError/details", async () => {
+		const bigText = "x".repeat(10 * 1024 * 1024); // ~10MB
+		const tool = createBigTool(bigText);
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, scriptToolCallThenDone("big"));
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const toolResultEndEvent = events.find((e) => e.type === "message_end" && e.message.role === "toolResult");
+		expect(toolResultEndEvent).toBeDefined();
+		if (toolResultEndEvent?.type !== "message_end" || toolResultEndEvent.message.role !== "toolResult") {
+			throw new Error("expected toolResult message_end event");
+		}
+		const message = toolResultEndEvent.message;
+		const textBlock = message.content.find((c) => c.type === "text");
+		expect(textBlock).toBeDefined();
+		const text = textBlock && textBlock.type === "text" ? textBlock.text : "";
+
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_TOOL_RESULT_BYTES);
+		expect(text).toContain("10485760"); // original byte size mentioned in marker
+		expect(text.toLowerCase()).toContain("big"); // tool name mentioned
+		expect(message.isError).toBe(false);
+		expect(message.details).toEqual({});
+	});
+
+	it("leaves small tool results byte-identical", async () => {
+		const smallText = "hello world";
+		const tool = createBigTool(smallText);
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, scriptToolCallThenDone("big"));
+		const messages = await stream.result();
+		const toolResult = messages.find((m) => m.role === "toolResult");
+		expect(toolResult?.role === "toolResult" ? toolResult.content : undefined).toEqual([
+			{ type: "text", text: smallText },
+		]);
+	});
+
+	it("honours a custom maxToolResultBytes", async () => {
+		const text = "a".repeat(5000);
+		const tool = createBigTool(text);
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxToolResultBytes: 1000,
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, scriptToolCallThenDone("big"));
+		const messages = await stream.result();
+		const toolResult = messages.find((m) => m.role === "toolResult");
+		const content = toolResult?.role === "toolResult" ? toolResult.content : [];
+		const textBlock = content.find((c) => c.type === "text");
+		const resultText = textBlock && textBlock.type === "text" ? textBlock.text : "";
+		expect(Buffer.byteLength(resultText, "utf8")).toBeLessThanOrEqual(1000);
+		expect(resultText).toContain("5000");
 	});
 });

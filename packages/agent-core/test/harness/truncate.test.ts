@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { truncateHead, truncateTail } from "../../src/harness/utils/truncate.ts";
+import { truncateHead, truncateStringToBytesFromStart, truncateTail } from "../../src/harness/utils/truncate.ts";
 
 const encoder = new TextEncoder();
 
@@ -174,5 +174,53 @@ describe("truncate utilities", () => {
 			for (let j = 0; j < length; j++) input += alphabet[Math.floor(random() * alphabet.length)];
 			assertMatchesBufferTail(input, sampledByteLimits(input));
 		}
+	});
+});
+
+describe("truncateStringToBytesFromStart", () => {
+	function bufferHead(content: string, maxBytes: number): string {
+		const bytes = Buffer.from(content, "utf8");
+		if (bytes.length <= maxBytes) return content;
+		let end = maxBytes;
+		// Back off while sitting on a UTF-8 continuation byte (10xxxxxx).
+		while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+		return bytes.subarray(0, end).toString("utf8");
+	}
+
+	it("never splits a multi-byte character or an unpaired surrogate, and stays valid UTF-8", () => {
+		// Mix of ASCII, 2/3/4-byte code points, an emoji (surrogate pair), and lone surrogate halves.
+		const input = `hello ${"é".repeat(3)}${"中".repeat(3)}${"😀".repeat(5)}𐀀world`;
+		const totalBytes = Buffer.byteLength(input, "utf8");
+
+		for (let maxBytes = 0; maxBytes <= totalBytes + 5; maxBytes++) {
+			const result = truncateStringToBytesFromStart(input, maxBytes);
+
+			// Bounded by the cap.
+			expect(Buffer.byteLength(result, "utf8")).toBeLessThanOrEqual(maxBytes);
+
+			// Round-trips through UTF-8 without producing/leaving unpaired surrogates
+			// (an unpaired surrogate would either throw or come back as U+FFFD from Buffer).
+			const roundTripped = Buffer.from(result, "utf8").toString("utf8");
+			expect(roundTripped).toBe(result);
+			expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(result)).toBe(false);
+		}
+	});
+
+	it("matches a naive byte-boundary head truncation for ASCII/emoji mixes", () => {
+		const input = "abc😀def中文ghi";
+		const totalBytes = Buffer.byteLength(input, "utf8");
+		for (let maxBytes = 0; maxBytes <= totalBytes + 2; maxBytes++) {
+			expect(truncateStringToBytesFromStart(input, maxBytes)).toBe(bufferHead(input, maxBytes));
+		}
+	});
+
+	it("returns the full string unchanged when it already fits", () => {
+		const input = "short and sweet";
+		expect(truncateStringToBytesFromStart(input, Buffer.byteLength(input, "utf8"))).toBe(input);
+	});
+
+	it("returns empty string for a non-positive cap", () => {
+		expect(truncateStringToBytesFromStart("anything", 0)).toBe("");
+		expect(truncateStringToBytesFromStart("anything", -5)).toBe("");
 	});
 });

@@ -303,6 +303,25 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Caps the combined byte size of text content blocks in every tool result,
+	 * applied after `afterToolCall` and just before the result becomes a
+	 * `ToolResultMessage` that enters session history and gets re-sent on every
+	 * subsequent turn. This is the one place that bounds ALL tool results -
+	 * built-in, extension, MCP, or custom - regardless of whether the tool
+	 * itself truncates its own output.
+	 *
+	 * When exceeded, a head (and tail) of the combined text is kept and an
+	 * elision marker is inserted stating the original size, the cap, the tool
+	 * name, and instructing the model to re-call with narrower arguments or
+	 * pagination. Image content blocks are never touched.
+	 *
+	 * `undefined` applies the default cap of 128KB, comfortably above the
+	 * built-in per-tool caps (50KB), so built-in tool output is unaffected.
+	 * Set explicitly to `0` (or any non-positive value) to disable capping.
+	 */
+	maxToolResultBytes?: number;
 }
 
 /**
