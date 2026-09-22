@@ -10,6 +10,7 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@step-harness/providers";
+import { createFailureMessage } from "./agent-failure.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AgentContext,
@@ -37,19 +38,28 @@ export function agentLoop(
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
 	const stream = createAgentStream();
+	const messagesSoFar: AgentMessage[] = [];
 
 	void runAgentLoop(
 		prompts,
 		context,
 		config,
 		async (event) => {
+			if (event.type === "message_end") {
+				messagesSoFar.push(event.message);
+			}
 			stream.push(event);
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error) => {
+			emitLoopFailure(stream, messagesSoFar, config, signal, error);
+		},
+	);
 
 	return stream;
 }
@@ -77,18 +87,27 @@ export function agentLoopContinue(
 	}
 
 	const stream = createAgentStream();
+	const messagesSoFar: AgentMessage[] = [];
 
 	void runAgentLoopContinue(
 		context,
 		config,
 		async (event) => {
+			if (event.type === "message_end") {
+				messagesSoFar.push(event.message);
+			}
 			stream.push(event);
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	).then(
+		(messages) => {
+			stream.end(messages);
+		},
+		(error) => {
+			emitLoopFailure(stream, messagesSoFar, config, signal, error);
+		},
+	);
 
 	return stream;
 }
@@ -148,6 +167,31 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+/**
+ * Invariant: a failure is its own terminal outcome — consumers of the stream
+ * (`for await`, `stream.result()`) must never hang. If `runAgentLoop`/
+ * `runAgentLoopContinue` rejects (e.g. `convertToLlm`, `transformContext`,
+ * `getApiKey`, or `streamFn` throws), synthesize a failure message mirroring
+ * `Agent.handleRunFailure` and end the stream with it instead of leaving the
+ * rejection unhandled.
+ */
+function emitLoopFailure(
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	messagesSoFar: AgentMessage[],
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	error: unknown,
+): void {
+	const failureMessage = createFailureMessage(config.model, signal?.aborted === true, error);
+	const messages = [...messagesSoFar, failureMessage];
+	stream.push({ type: "message_start", message: failureMessage });
+	stream.push({ type: "message_end", message: failureMessage });
+	stream.push({ type: "turn_end", message: failureMessage, toolResults: [] });
+	// Pushing `agent_end` already completes the stream (see EventStream.push);
+	// no separate `stream.end(...)` call is needed or safe to add here.
+	stream.push({ type: "agent_end", messages });
 }
 
 /**

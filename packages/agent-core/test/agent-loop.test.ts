@@ -1730,3 +1730,133 @@ describe("tool-call markup leak retry", () => {
 		expect(calls()).toBe(2);
 	});
 });
+
+describe("agentLoop / agentLoopContinue rejection handling", () => {
+	// Invariant under test: a rejection from anywhere inside the loop (a
+	// throwing convertToLlm/transformContext/getApiKey/streamFn, etc.) is its
+	// own terminal outcome. The stream must still end, `stream.result()` must
+	// still resolve (never hang), and no unhandled rejection should surface
+	// (vitest fails the run on those).
+
+	it("agentLoop: a throwing convertToLlm terminates the stream with a failure message", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("convertToLlm boom");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("streamFn should never be called");
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(events.at(-1)?.type).toBe("agent_end");
+
+		const messages = await stream.result();
+		const failure = messages.at(-1) as AssistantMessage;
+		expect(failure.role).toBe("assistant");
+		expect(failure.stopReason).toBe("error");
+		expect(failure.errorMessage).toBe("convertToLlm boom");
+		expect(failure.usage).toEqual(createUsage());
+		expect(failure.model).toBe("mock");
+		expect(failure.api).toBe("openai-responses");
+		expect(failure.provider).toBe("openai");
+	});
+
+	it("agentLoopContinue: a throwing convertToLlm terminates the stream with a failure message", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [createUserMessage("Hello")],
+			tools: [],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("convertToLlm boom (continue)");
+			},
+		};
+
+		const streamFn = () => {
+			throw new Error("streamFn should never be called");
+		};
+
+		const stream = agentLoopContinue(context, config, undefined, streamFn);
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		expect(events.at(-1)?.type).toBe("agent_end");
+
+		const messages = await stream.result();
+		const failure = messages.at(-1) as AssistantMessage;
+		expect(failure.stopReason).toBe("error");
+		expect(failure.errorMessage).toBe("convertToLlm boom (continue)");
+	});
+
+	it("agentLoop: reports stopReason 'aborted' when the signal is already aborted", async () => {
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: () => {
+				throw new Error("boom while aborted");
+			},
+		};
+
+		const controller = new AbortController();
+		controller.abort();
+
+		const streamFn = () => {
+			throw new Error("streamFn should never be called");
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, controller.signal, streamFn);
+
+		for await (const _event of stream) {
+			// drain
+		}
+
+		const messages = await stream.result();
+		const failure = messages.at(-1) as AssistantMessage;
+		expect(failure.stopReason).toBe("aborted");
+		expect(failure.errorMessage).toBe("boom while aborted");
+	});
+
+	it("agentLoop: does not raise an unhandled rejection when the loop rejects", async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+
+		try {
+			const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: () => {
+					throw new Error("unhandled check boom");
+				},
+			};
+			const streamFn = () => {
+				throw new Error("streamFn should never be called");
+			};
+
+			const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+			await stream.result();
+
+			// Give any (incorrectly) unhandled rejection a microtask/macrotask to surface.
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+});
