@@ -12,6 +12,17 @@ import type {
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
 
+// Text synthesized for a tool call that was interrupted (session ended, aborted, or crashed)
+// before a result was ever recorded. This must never claim the tool failed or succeeded --
+// the outcome is genuinely unknown, so the model must verify current state before retrying
+// instead of blindly re-running potentially non-idempotent side effects.
+export function synthesizeInterruptedToolResultText(toolName: string): string {
+	return (
+		`Tool call "${toolName}" was interrupted before a result was recorded (session ended, aborted, or crashed). ` +
+		"Its side effects may or may not have happened -- verify the current state (e.g. re-read files, check processes) before retrying."
+	);
+}
+
 function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], placeholder: string): TextContent[] {
 	const result: TextContent[] = [];
 	let previousWasPlaceholder = false;
@@ -168,7 +179,7 @@ export function transformMessages<TApi extends Api>(
 						role: "toolResult",
 						toolCallId: tc.id,
 						toolName: tc.name,
-						content: [{ type: "text", text: "No result provided" }],
+						content: [{ type: "text", text: synthesizeInterruptedToolResultText(tc.name) }],
 						isError: true,
 						timestamp: Date.now(),
 					} as ToolResultMessage);

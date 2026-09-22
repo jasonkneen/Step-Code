@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { transformMessages } from "../src/api/transform-messages.ts";
+import { synthesizeInterruptedToolResultText, transformMessages } from "../src/api/transform-messages.ts";
 import type { AssistantMessage, Message, Model, ToolCall } from "../src/types.ts";
 
 // Normalize function matching what anthropic.ts uses
@@ -155,7 +155,7 @@ describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
 			toolCallId: "call_123_fc_123",
 			toolName: "read",
 			isError: true,
-			content: [{ type: "text", text: "No result provided" }],
+			content: [{ type: "text", text: synthesizeInterruptedToolResultText("read") }],
 		});
 	});
 
@@ -185,7 +185,54 @@ describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
 			role: "toolResult",
 			toolCallId: "call_2_fc_2",
 			toolName: "bash",
-			content: [{ type: "text", text: "No result provided" }],
+			content: [{ type: "text", text: synthesizeInterruptedToolResultText("bash") }],
 		});
+	});
+
+	it("synthesized interrupted tool result names the tool, marks it an error, and warns the outcome is unknown (not a failure)", () => {
+		const model = makeCopilotClaudeModel();
+		const messages: Message[] = [
+			{ role: "user", content: "run a command", timestamp: Date.now() },
+			makeAssistantMessage([
+				{ type: "toolCall", id: "call_1|fc_1", name: "bash", arguments: { command: "rm -rf build" } },
+			]),
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+		const synthetic = result[result.length - 1] as Message & { role: "toolResult" };
+
+		expect(synthetic.role).toBe("toolResult");
+		expect((synthetic as { isError?: boolean }).isError).toBe(true);
+		const text = (synthetic as { content: { type: string; text: string }[] }).content[0].text;
+		// Names the interrupted tool.
+		expect(text).toContain('"bash"');
+		// States the call was interrupted, not that it failed or succeeded.
+		expect(text).toMatch(/interrupted/i);
+		// Makes explicit that the side effect's outcome is unknown.
+		expect(text).toMatch(/may or may not have happened/i);
+		// Instructs verification before any retry, ruling out blind re-execution.
+		expect(text).toMatch(/verify/i);
+	});
+
+	it("does not duplicate a synthetic result when a real tool result is already present", () => {
+		const model = makeCopilotClaudeModel();
+		const messages: Message[] = [
+			{ role: "user", content: "run a command", timestamp: Date.now() },
+			makeAssistantMessage([{ type: "toolCall", id: "call_1|fc_1", name: "bash", arguments: { command: "pwd" } }]),
+			{
+				role: "toolResult",
+				toolCallId: "call_1|fc_1",
+				toolName: "bash",
+				content: [{ type: "text", text: "/repo" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+		const toolResults = result.filter((message) => message.role === "toolResult");
+
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "/repo" }] });
 	});
 });
