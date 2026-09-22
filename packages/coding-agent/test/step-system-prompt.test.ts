@@ -1,9 +1,19 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { buildStepSystemPromptAppendix, invalidateGitEnvironmentCache } from "../src/step/system-prompt.ts";
+
+/** Everything before the trailing `<env>` block, which must be byte-identical
+ * across rebuilds so provider prompt caches keyed on the prefix survive. */
+function staticPrefix(prompt: string): string {
+	const envStart = prompt.indexOf("<env>");
+	expect(envStart).toBeGreaterThan(-1);
+	// The env block is joined onto the prior static section with "\n\n".
+	return prompt.slice(0, envStart).replace(/\n\n$/, "");
+}
 
 const hasGit = ((): boolean => {
 	try {
@@ -316,5 +326,51 @@ describe("Step system prompt appendix", () => {
 		const prompt = buildStepSystemPromptAppendix([], { cwd: "/nonexistent/step-prompt-env" });
 		expect(prompt).toContain("<env>");
 		expect(prompt).not.toContain("Git branch:");
+	});
+
+	it("places the dynamic env block last so the static prefix is stable across date/cwd/git state", () => {
+		const tools = ["read_file", "edit_file", "run_command"];
+		const a = buildStepSystemPromptAppendix(tools, {
+			cwd: "/workspace/step-a",
+			platform: "linux",
+			date: "2026-08-30",
+		});
+		const b = buildStepSystemPromptAppendix(tools, {
+			cwd: "/workspace/step-b-longer-path",
+			platform: "darwin",
+			date: "2027-01-01",
+		});
+
+		// The env block, including its trailing cwd-semantics sentences, is the
+		// very last thing in the appendix: nothing static follows it.
+		const envTailSentence =
+			"Git state is not assumed to be clean; inspect it before changing repository files and preserve unrelated user changes.";
+		expect(a.trimEnd().endsWith(envTailSentence)).toBe(true);
+		expect(b.trimEnd().endsWith(envTailSentence)).toBe(true);
+		expect(a.indexOf("<env>")).toBe(a.lastIndexOf("<env>"));
+		expect(b.indexOf("<env>")).toBe(b.lastIndexOf("<env>"));
+
+		const prefixA = staticPrefix(a);
+		const prefixB = staticPrefix(b);
+		expect(prefixA).toBe(prefixB);
+		// Sanity: the differing content really is confined to the env tail.
+		expect(a).not.toBe(b);
+		expect(a.slice(a.indexOf("<env>"))).not.toBe(b.slice(b.indexOf("<env>")));
+	});
+
+	// Pins the byte-identical static prefix (everything before the trailing
+	// <env> block) for a fixed tool set. If you intentionally change any
+	// static prompt wording/ordering for this tool set, recompute this hash
+	// (e.g. `sha256sum` the new prefix) and update it in the same commit.
+	it("pins a hash of the static prefix for a fixed tool set", () => {
+		const tools = ["read_file", "edit_file", "write_file", "run_command", "search_files", "find_files"];
+		const prompt = buildStepSystemPromptAppendix(tools, {
+			cwd: "/workspace/pin",
+			platform: "linux",
+			date: "2026-09-22",
+		});
+		const prefix = staticPrefix(prompt);
+		const hash = createHash("sha256").update(prefix).digest("hex");
+		expect(hash).toBe("68f93aa9e63dd97eddb37890960c45b53021a6140a39f79d79f92e3e650f97c2");
 	});
 });
