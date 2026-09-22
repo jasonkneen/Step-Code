@@ -35,6 +35,7 @@ import {
 	type ProviderRequestOptions,
 	type SimpleStreamOptions,
 	type StreamOptions,
+	withStreamIdleTimeout,
 } from "@step-harness/providers";
 import * as builtinProviderCatalog from "@step-harness/providers/providers/all";
 import { getAgentDir, STEP_ENTRYPOINT } from "../config.ts";
@@ -587,17 +588,19 @@ export class ModelRuntime implements Models {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
-			return prepared.provider.stream(
-				prepared.model as Model<TApi>,
-				context,
-				prepared.options as ApiStreamOptions<TApi>,
-			);
-		});
+		return withStreamIdleTimeout(model, options, (guardedOptions) =>
+			lazyStream(model, async () => {
+				const prepared = await this.prepareRequest(
+					model,
+					guardedOptions as (StreamOptions & ModelsRequestTransforms) | undefined,
+				);
+				return prepared.provider.stream(
+					prepared.model as Model<TApi>,
+					context,
+					prepared.options as ApiStreamOptions<TApi>,
+				);
+			}),
+		);
 	}
 
 	complete<TApi extends Api>(
@@ -609,10 +612,12 @@ export class ModelRuntime implements Models {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
-		});
+		return withStreamIdleTimeout(model, options, (guardedOptions) =>
+			lazyStream(model, async () => {
+				const prepared = await this.prepareRequest(model, guardedOptions);
+				return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
+			}),
+		);
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {

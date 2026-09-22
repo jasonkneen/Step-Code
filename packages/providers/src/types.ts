@@ -189,6 +189,13 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 */
 	websocketConnectTimeoutMs?: number;
 	/**
+	 * Content-idle watchdog in milliseconds. When > 0, the stream fails with
+	 * `stopReason: "error"` if no stream event (start, deltas, block start/end)
+	 * is emitted for this long; keepalive pings do not reset it. The request is
+	 * aborted on expiry. 0 or undefined disables the watchdog.
+	 */
+	streamIdleTimeoutMs?: number;
+	/**
 	 * Optional metadata to include in API requests.
 	 * Providers extract the fields they understand and ignore the rest.
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.

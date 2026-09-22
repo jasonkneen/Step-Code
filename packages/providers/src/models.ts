@@ -33,6 +33,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { withStreamIdleTimeout } from "./utils/stream-idle-timeout.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
 
@@ -669,14 +670,16 @@ class ModelsImpl implements MutableModels {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const provider = this.requireProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(
-				model,
-				options as ModelsApiStreamOptions<Api> | undefined,
-			);
-			return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
-		});
+		return withStreamIdleTimeout(model, options, (guardedOptions) =>
+			lazyStream(model, async () => {
+				const provider = this.requireProvider(model);
+				const { requestModel, requestOptions } = await this.applyAuth(
+					model,
+					guardedOptions as ModelsApiStreamOptions<Api> | undefined,
+				);
+				return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
+			}),
+		);
 	}
 
 	async complete<TApi extends Api>(
@@ -688,11 +691,13 @@ class ModelsImpl implements MutableModels {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const provider = this.requireProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
-			return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
-		});
+		return withStreamIdleTimeout(model, options, (guardedOptions) =>
+			lazyStream(model, async () => {
+				const provider = this.requireProvider(model);
+				const { requestModel, requestOptions } = await this.applyAuth(model, guardedOptions);
+				return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
+			}),
+		);
 	}
 
 	async completeSimple(
@@ -826,9 +831,14 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 				}
 			: undefined,
 		filterModels: input.filterModels,
-		stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options)),
+		stream: (model, context, options) =>
+			withStreamIdleTimeout(model, options, (guardedOptions) =>
+				dispatch(model, (streams) => streams.stream(model, context, guardedOptions)),
+			),
 		streamSimple: (model, context, options) =>
-			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
+			withStreamIdleTimeout(model, options, (guardedOptions) =>
+				dispatch(model, (streams) => streams.streamSimple(model, context, guardedOptions)),
+			),
 	};
 
 	const streams = single ? [single] : Object.values(byApi ?? {}).filter((entry) => entry !== undefined);

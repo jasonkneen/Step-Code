@@ -40,6 +40,7 @@ import type {
 	StreamFunction,
 	StreamOptions,
 } from "./types.ts";
+import { withStreamIdleTimeout } from "./utils/stream-idle-timeout.ts";
 
 /** @deprecated Static catalog read. Use `getBuiltinModel` from "@step-harness/providers/providers/all" or `Models.getModel()`. */
 export const getModel = getBuiltinModel;
@@ -235,7 +236,9 @@ export function stream<TApi extends Api>(
 		return builtinProvider.stream(model, context, withEnvApiKey(model, options) as ApiStreamOptions<TApi>);
 	}
 	const provider = resolveApiProvider(model.api);
-	return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
+	return withStreamIdleTimeout(model, withEnvApiKey(model, options) as StreamOptions | undefined, (guardedOptions) =>
+		provider.stream(model, context, guardedOptions),
+	);
 }
 
 export async function complete<TApi extends Api>(
@@ -260,7 +263,9 @@ export function streamSimple<TApi extends Api>(
 		return builtinProvider.streamSimple(model, context, withEnvApiKey(model, options));
 	}
 	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, context, withEnvApiKey(model, options));
+	return withStreamIdleTimeout(model, withEnvApiKey(model, options), (guardedOptions) =>
+		provider.streamSimple(model, context, guardedOptions),
+	);
 }
 
 export async function completeSimple<TApi extends Api>(

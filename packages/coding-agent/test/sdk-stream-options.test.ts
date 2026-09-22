@@ -143,6 +143,21 @@ describe("createAgentSession stream options", () => {
 		expect(options?.timeoutMs).toBe(0);
 	});
 
+	it("guards the stream with a content-idle watchdog from httpIdleTimeoutMs", async () => {
+		const options = await captureStreamOptions("openai-completions", { httpIdleTimeoutMs: 1234 });
+
+		// The watchdog consumes the option and links its own abort signal to the request.
+		expect(options).not.toHaveProperty("streamIdleTimeoutMs");
+		expect(options?.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("installs no content-idle watchdog when httpIdleTimeoutMs is 0", async () => {
+		const options = await captureStreamOptions("openai-completions", { httpIdleTimeoutMs: 0 });
+
+		expect(options?.streamIdleTimeoutMs).toBe(0);
+		expect(options?.signal).toBeUndefined();
+	});
+
 	it("forwards websocketConnectTimeoutMs from settings", async () => {
 		const options = await captureStreamOptions("openai-responses", { websocketConnectTimeoutMs: 1234 });
 

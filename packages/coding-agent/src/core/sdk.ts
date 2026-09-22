@@ -353,6 +353,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const requestOptions: ModelsSimpleStreamOptions = {
 				...options,
 				timeoutMs,
+				// Content-idle watchdog: same budget as the transport idle timeout, but
+				// keepalive pings do not reset it (0 disables).
+				streamIdleTimeoutMs: options?.streamIdleTimeoutMs ?? httpIdleTimeoutMs,
 				websocketConnectTimeoutMs,
 				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
