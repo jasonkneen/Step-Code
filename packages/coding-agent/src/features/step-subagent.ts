@@ -289,11 +289,28 @@ function usageFromMessage(message: Message, usage: StepSubagentUsage): void {
 	usage.cost += messageUsage.cost?.total || 0;
 }
 
+/**
+ * A "length" stop means the child's provider hit its output token limit: the
+ * final assistant message is truncated mid-generation and agent-loop refuses
+ * to execute any tool calls it may contain (see agent-loop.ts). That is never
+ * a successful result, so it is treated as a failure alongside "error" and
+ * "aborted" rather than being reported to the parent as "completed".
+ */
 export function isFailed(result: Pick<StepSubagentRunResult, "exitCode" | "stopReason">): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return (
+		result.exitCode !== 0 ||
+		result.stopReason === "error" ||
+		result.stopReason === "aborted" ||
+		result.stopReason === "length"
+	);
 }
 
 export function resultText(result: StepSubagentRunResult): string {
+	if (result.stopReason === "length") {
+		const message = result.errorMessage || "Subagent response hit the output token limit; result is truncated.";
+		const partial = finalOutput(result.messages);
+		return partial ? `${message}\n\n${partial}` : message;
+	}
 	if (isFailed(result)) return result.errorMessage || result.stderr || finalOutput(result.messages) || "(no output)";
 	return finalOutput(result.messages) || "(no output)";
 }
@@ -367,7 +384,11 @@ export function parseJsonEvent(
 		if (isAssistantMessage(message)) {
 			if (message.model) current.model = message.model;
 			current.stopReason = message.stopReason;
-			current.errorMessage = message.errorMessage;
+			current.errorMessage =
+				message.errorMessage ??
+				(message.stopReason === "length"
+					? "Subagent response hit the output token limit; result is truncated."
+					: undefined);
 			current.activeText = assistantText(message) || current.activeText;
 			current.activeTool = undefined;
 			current.activeToolArgs = undefined;

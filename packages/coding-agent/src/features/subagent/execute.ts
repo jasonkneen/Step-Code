@@ -53,7 +53,7 @@ interface StepSubagentTaskInput {
 	retainWorktree?: boolean;
 }
 
-function statusForResult(result: StepSubagentRunResult): StepSubagentResultRecord["status"] {
+export function statusForResult(result: StepSubagentRunResult): StepSubagentResultRecord["status"] {
 	if (result.exitCode === -1) return "running";
 	if (result.stopReason === "aborted") return "aborted";
 	return isFailed(result) ? "failed" : "completed";
