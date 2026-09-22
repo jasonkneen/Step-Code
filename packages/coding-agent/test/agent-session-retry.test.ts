@@ -148,6 +148,98 @@ describe("AgentSession retry", () => {
 		expect(created.session.isRetrying).toBe(false);
 	});
 
+	it("does not auto-retry a resampled tool-call markup leak", async () => {
+		// Regression: agent-loop's own leak-retry resamples a turn whose text
+		// leaked raw `<tool_call>` markup, and marks the leaked attempt with
+		// stopReason "error" so it is never replayed. That marker must not be
+		// mistaken for a transient provider error and trigger AgentSession's
+		// separate auto-retry path on top of the already-resampled turn.
+		const LEAK_TEXT = "<tool_call> <function=run_command> ls </function> </tool_call>";
+		let callCount = 0;
+		const requestMessages: unknown[][] = [];
+		const model = stepModel();
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: (_model, llmContext: { messages: unknown[] }) => {
+				callCount++;
+				requestMessages.push([...llmContext.messages]);
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					// Call 1 leaks; call 2 resamples cleanly (both inside the first
+					// prompt()); call 3 is a later, independent prompt() built from
+					// the persisted (marked) history.
+					const msg = callCount === 1 ? createAssistantMessage(LEAK_TEXT) : createAssistantMessage("done cleanly");
+					stream.push({ type: "start", partial: msg });
+					stream.push({ type: "done", reason: "stop", message: msg });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("step", async () => ({ type: "api_key", key: "test-key" }));
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRuntime: getModelRuntime(modelRegistry),
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		const events: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+			if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+		});
+
+		await session.prompt("Test");
+
+		// agent-loop resampled once on its own (2 model calls); AgentSession's
+		// separate auto-retry never fired on top of it.
+		expect(callCount).toBe(2);
+		expect(events).toEqual([]);
+		expect(session.isRetrying).toBe(false);
+
+		const messages = session.agent.state.messages;
+		const leakedMessage = messages.find(
+			(m) =>
+				m.role === "assistant" &&
+				(m as AssistantMessage).content.some((c) => c.type === "text" && c.text === LEAK_TEXT),
+		) as AssistantMessage | undefined;
+		expect(leakedMessage?.stopReason).toBe("error");
+
+		// A later, independent prompt() rebuilds its request from persisted
+		// history. `@step-harness/providers`' internal transformMessages (used by
+		// every real provider adapter just before the wire request) is what
+		// actually strips stopReason "error"/"aborted" assistant messages from
+		// that history - it isn't exported for reuse here, so this asserts the
+		// same invariant with an equivalent hand-rolled filter: the raw
+		// (unfiltered) request still carries the marked leak object (proving
+		// coding-agent's own convertToLlm does not itself strip it - matching
+		// production, where the real provider layer does that job), but the
+		// filter a replay path applies removes the leaked text entirely.
+		await session.prompt("Again");
+		expect(callCount).toBe(3);
+
+		const rawThirdRequest = requestMessages[2] as AssistantMessage[];
+		const serializedRaw = JSON.stringify(rawThirdRequest);
+		expect(serializedRaw).toContain(LEAK_TEXT);
+
+		const replayableThirdRequest = rawThirdRequest.filter(
+			(m) => !(m.role === "assistant" && (m.stopReason === "error" || m.stopReason === "aborted")),
+		);
+		const serializedReplayable = JSON.stringify(replayableThirdRequest);
+		expect(serializedReplayable).not.toContain(LEAK_TEXT);
+		expect(serializedReplayable).toContain("done cleanly");
+	});
+
 	it("exhausts max retries and emits failure", async () => {
 		const created = await createSession({ failCount: 99, maxRetries: 2 });
 		const events: string[] = [];

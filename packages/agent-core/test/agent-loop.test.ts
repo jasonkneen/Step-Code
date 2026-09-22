@@ -1649,9 +1649,60 @@ describe("tool-call markup leak retry", () => {
 		// context to the first call.
 		expect(requestMessages[1]).toEqual(requestMessages[0]);
 		// Both attempts remain observable in the event stream.
-		expect(events.filter((e) => e.type === "message_end" && (e as any).message.role === "assistant")).toHaveLength(2);
+		const assistantMessageEnds = events.filter(
+			(e) => e.type === "message_end" && (e as any).message.role === "assistant",
+		) as Extract<AgentEvent, { type: "message_end" }>[];
+		expect(assistantMessageEnds).toHaveLength(2);
+		// The leaked attempt is reclassified as a non-retryable error turn so it can
+		// never be replayed to the model (transform-messages.ts skips stopReason
+		// "error"/"aborted" assistant messages), while the resampled turn is
+		// committed unmarked with its real content intact.
+		const leakedEndMessage = assistantMessageEnds[0].message as AssistantMessage;
+		expect(leakedEndMessage.stopReason).toBe("error");
+		expect(leakedEndMessage.errorMessage).toMatch(/leak/i);
+		const finalEndMessage = assistantMessageEnds[1].message as AssistantMessage;
+		expect(finalEndMessage.stopReason).toBe("stop");
+		expect(finalEndMessage.content).toEqual([{ type: "text", text: "done cleanly" }]);
 		// Only one turn ends.
 		expect(events.filter((e) => e.type === "turn_end")).toHaveLength(1);
+	});
+
+	it("excludes the marked leaked attempt from a later turn built from persisted messages", async () => {
+		// Simulates what happens across a resumed session: everything observed via
+		// message_end (including the leaked attempt) is what gets persisted and fed
+		// back in as `messages` for the next turn. A replay-aware convertToLlm (like
+		// providers' transformMessages) must not see the raw leaked markup.
+		const leaked = createAssistantMessage([{ type: "text", text: LEAK_TEXT }]);
+		const good = createAssistantMessage([{ type: "text", text: "done cleanly" }]);
+		const { streamFn } = scriptedStream([leaked, good]);
+
+		const persisted: AgentMessage[] = [];
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			if (event.type === "message_end") persisted.push(event.message);
+		}
+
+		// The leaked attempt IS in persisted history (kept for observability)...
+		const persistedAssistants = persisted.filter((m) => m.role === "assistant") as AssistantMessage[];
+		expect(persistedAssistants).toHaveLength(2);
+		expect(persistedAssistants[0].stopReason).toBe("error");
+
+		// ...but a replay-skip filter equivalent to providers' transformMessages
+		// (skip assistant messages with stopReason "error"/"aborted") removes the
+		// leaked markup entirely from what a later turn would send to the model.
+		const replayableForNextTurn = persisted.filter(
+			(m) =>
+				!(
+					m.role === "assistant" &&
+					((m as AssistantMessage).stopReason === "error" || (m as AssistantMessage).stopReason === "aborted")
+				),
+		);
+		const serialized = JSON.stringify(replayableForNextTurn);
+		expect(serialized).not.toContain("tool_call");
+		expect(serialized).toContain("done cleanly");
 	});
 
 	it("stops after the bounded retries and commits the last attempt", async () => {
@@ -1661,17 +1712,29 @@ describe("tool-call markup leak retry", () => {
 		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
 		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
 
+		const events: AgentEvent[] = [];
 		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
-		for await (const _event of stream) {
-			// drain
-		}
+		for await (const event of stream) events.push(event);
 		const messages = await stream.result();
 
 		// 1 initial + 2 default retries.
 		expect(calls()).toBe(3);
 		expect(requestMessages[1]).toEqual(requestMessages[0]);
 		expect(requestMessages[2]).toEqual(requestMessages[0]);
+		// Budget exhausted: the final leaked attempt stays as-is (not marked), so
+		// it keeps carrying the raw leaked text as its own committed content.
 		expect((messages.at(-1) as AssistantMessage).content).toEqual([{ type: "text", text: LEAK_TEXT }]);
+		expect((messages.at(-1) as AssistantMessage).stopReason).toBe("stop");
+
+		const assistantMessageEnds = events.filter(
+			(e) => e.type === "message_end" && (e as any).message.role === "assistant",
+		) as Extract<AgentEvent, { type: "message_end" }>[];
+		expect(assistantMessageEnds).toHaveLength(3);
+		// The two resampled (superseded) attempts are marked non-retryable...
+		expect((assistantMessageEnds[0].message as AssistantMessage).stopReason).toBe("error");
+		expect((assistantMessageEnds[1].message as AssistantMessage).stopReason).toBe("error");
+		// ...but the last, budget-exhausted attempt is committed unmarked.
+		expect((assistantMessageEnds[2].message as AssistantMessage).stopReason).toBe("stop");
 	});
 
 	it("can be disabled with toolCallLeakRetries: 0", async () => {

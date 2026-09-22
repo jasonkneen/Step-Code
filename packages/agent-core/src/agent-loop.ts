@@ -208,7 +208,9 @@ async function runLoop(
 				pendingMessages = [];
 			}
 
-			// Stream assistant response
+			// Stream assistant response. message_end is emitted below (not inside
+			// streamAssistantResponse) so a leaked attempt can be classified before
+			// it is ever recorded as replayable.
 			let message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 
 			// Serving-side tool parsers can fail and leak the model's tool-call
@@ -216,13 +218,22 @@ async function runLoop(
 			// and the loop would end even though the model meant to act.
 			// Resample the identical context a bounded number of times; the
 			// leaked attempt is dropped from the request context while its
-			// message events above remain for observability.
+			// message events above remain for observability. Each resampled
+			// attempt is finalized as a non-retryable error turn (never as its raw
+			// "stop" content) so transform-messages.ts's error/aborted replay skip
+			// keeps the leaked markup out of the next request and out of any later
+			// resumed session — without this, the raw `<tool_call>` text would be
+			// replayed to the model, teaching it the broken format.
 			const leakRetryLimit = config.toolCallLeakRetries ?? DEFAULT_TOOL_CALL_LEAK_RETRIES;
 			for (let attempt = 0; attempt < leakRetryLimit && isToolCallMarkupLeak(message); attempt++) {
 				if (currentContext.messages[currentContext.messages.length - 1] !== message) break;
+				await emit({ type: "message_end", message: markLeakedAttemptNonReplayable(message) });
 				currentContext.messages.pop();
 				message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			}
+			// Final attempt for this turn (resampled success, or the last leaked
+			// attempt once the retry budget is exhausted) is committed as-is.
+			await emit({ type: "message_end", message });
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -288,6 +299,13 @@ async function runLoop(
 /**
  * Stream an assistant response from the LLM.
  * This is where AgentMessage[] gets transformed to Message[] for the LLM.
+ *
+ * Emits `message_start` / `message_update` as the response streams in, and
+ * pushes the finalized message onto `context.messages`, but deliberately does
+ * NOT emit `message_end` for it — the caller (runLoop) decides how to
+ * finalize each attempt (as-is, or reclassified as a non-replayable error
+ * turn) before that event, which is what lands the message in Agent state
+ * and session history.
  */
 /** Bounded default for resampling turns whose tool call leaked into text. */
 const DEFAULT_TOOL_CALL_LEAK_RETRIES = 2;
@@ -313,6 +331,26 @@ function isToolCallMarkupLeak(message: AssistantMessage): boolean {
 		}
 	}
 	return sawMarkup;
+}
+
+/**
+ * Reclassify a leaked-markup attempt that is about to be resampled as a
+ * failed, non-retryable turn. `providers`' `transformMessages` already skips
+ * assistant messages with stopReason "error" (or "aborted") when building the
+ * next request, so marking it this way removes the raw `<tool_call>` text
+ * from every future request built from this context — including a later
+ * resumed session — while the message itself (and its own message_start /
+ * message_end events) still lands in state and persisted history for
+ * observability. The errorMessage text intentionally does not match
+ * providers' transient-error retry patterns, so this can never be picked up
+ * by an automatic error-retry / autopilot-resume path.
+ */
+function markLeakedAttemptNonReplayable(message: AssistantMessage): AssistantMessage {
+	return {
+		...message,
+		stopReason: "error",
+		errorMessage: "Tool-call markup leaked into text; response was resampled.",
+	};
 }
 
 async function streamAssistantResponse(
@@ -391,7 +429,6 @@ async function streamAssistantResponse(
 				if (!addedPartial) {
 					await emit({ type: "message_start", message: { ...finalMessage } });
 				}
-				await emit({ type: "message_end", message: finalMessage });
 				return finalMessage;
 			}
 		}
@@ -404,7 +441,6 @@ async function streamAssistantResponse(
 		context.messages.push(finalMessage);
 		await emit({ type: "message_start", message: { ...finalMessage } });
 	}
-	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
 }
 
