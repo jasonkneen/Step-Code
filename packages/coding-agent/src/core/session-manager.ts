@@ -26,6 +26,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { acquireSessionWriterLock, releaseSessionWriterLock } from "./session-writer-lock.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -860,6 +861,8 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	/** Writer lock held for sessionFile; acquired lazily on first write. */
+	private writerLockPath: string | undefined;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -894,6 +897,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this._releaseWriterLock();
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -932,6 +936,7 @@ export class SessionManager {
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
+		this._releaseWriterLock();
 		this.sessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
@@ -977,8 +982,26 @@ export class SessionManager {
 		}
 	}
 
+	/** Take the single-writer lock for the current session file before touching it. */
+	private _acquireWriterLock(): void {
+		if (this.writerLockPath || !this.sessionFile) return;
+		this.writerLockPath = acquireSessionWriterLock(this.sessionFile);
+	}
+
+	private _releaseWriterLock(): void {
+		if (!this.writerLockPath) return;
+		releaseSessionWriterLock(this.writerLockPath);
+		this.writerLockPath = undefined;
+	}
+
+	/** Release the session file writer lock. The manager reacquires it if written to again. */
+	dispose(): void {
+		this._releaseWriterLock();
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
+		this._acquireWriterLock();
 		const fd = openSync(this.sessionFile, "w");
 		try {
 			for (const entry of this.fileEntries) {
@@ -1019,6 +1042,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
+				this._acquireWriterLock();
 				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
@@ -1027,6 +1051,7 @@ export class SessionManager {
 			return;
 		}
 
+		this._acquireWriterLock();
 		if (!this.flushed) {
 			const fd = openSync(this.sessionFile, "wx");
 			try {
@@ -1473,6 +1498,7 @@ export class SessionManager {
 
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 			this.sessionId = newSessionId;
+			this._releaseWriterLock();
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 

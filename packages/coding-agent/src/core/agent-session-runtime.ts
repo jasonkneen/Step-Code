@@ -262,6 +262,9 @@ export class AgentSessionRuntime implements AgentSessionRuntimeHost {
 		});
 		this.beforeSessionInvalidate?.();
 		session.dispose();
+		// Release the outgoing session file's writer lock so other processes can
+		// resume it. A manager reused by the replacement reacquires it on write.
+		session.sessionManager.dispose();
 		if (this._session === session) this.currentSessionDisposed = true;
 	}
 
@@ -537,6 +540,7 @@ export class AgentSessionRuntime implements AgentSessionRuntimeHost {
 					});
 					this.beforeSessionInvalidate?.();
 					session.dispose();
+					session.sessionManager.dispose();
 					this.currentSessionDisposed = true;
 				}
 			} finally {

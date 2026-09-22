@@ -5350,7 +5350,11 @@ export class InteractiveMode {
 										sessionDir: this.sessionManager.getSessionDir(),
 									})
 								: SessionManager.open(sessionFilePath);
-						mgr.appendSessionInfo(next);
+						try {
+							mgr.appendSessionInfo(next);
+						} finally {
+							mgr.dispose();
+						}
 					},
 					showRenameHint: true,
 					keybindings: this.keybindings,
