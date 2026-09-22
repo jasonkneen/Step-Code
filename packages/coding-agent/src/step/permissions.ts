@@ -7,6 +7,7 @@
  */
 
 import type { AgentMessage } from "@step-harness/agent-core";
+import type { EventBus } from "../core/event-bus.ts";
 import type {
 	AgentEndEvent,
 	ExtensionContext,
@@ -321,6 +322,95 @@ export function resolveInitialStepPermissionState(options: StepPermissionControl
 		resolved.toolOverrides = cloneToolOverrides(options.toolOverrides);
 	}
 	return resolved;
+}
+
+/**
+ * The explicit policy handed to a subagent child (`--approval-mode`,
+ * `--non-interactive-approval`, `--tool-override`, and `STEP_AUTO_RESUME`).
+ * Explicit flags outrank every `STEP_*` env var and persisted preset in the
+ * child's resolver, so whatever the child inherits cannot loosen this.
+ */
+export interface StepChildPermissionPolicy {
+	approvalMode: StepPermissionMode;
+	nonInteractiveApproval: StepNonInteractiveApproval;
+	autoResume: boolean;
+	toolOverrides?: Record<string, StepToolPermissionMode>;
+}
+
+/**
+ * Derive a subagent child's policy from the parent's live state. The child must
+ * never be more permissive than the parent:
+ *
+ *   - A headless parent passes on the policy it actually enforces: `auto` that
+ *     is refused or unconfigured unattended is downgraded to `confirm`/`deny`,
+ *     the same downgrade StepPermissionController applies to its own calls.
+ *   - A defaulted parent (nothing selected a policy) keeps its mode but never
+ *     hands the child an explicit unattended `allow`: the fallback is `deny`,
+ *     which mirrors the defaulted semantics (permissive only while a UI exists)
+ *     now that the explicit flag takes the child out of the defaulted bucket.
+ *   - `strict` and `confirm` pass through unchanged. The rpc child's blocking
+ *     dialogs are auto-cancelled by the parent, so a child `confirm` blocks.
+ */
+export function resolveStepChildPermissionPolicy(
+	state: StepPermissionState,
+	parentHasUI: boolean,
+): StepChildPermissionPolicy {
+	let approvalMode = state.mode;
+	let nonInteractiveApproval: StepNonInteractiveApproval =
+		state.defaulted === true ? "deny" : state.nonInteractiveApproval;
+	const unattendedRefused = !parentHasUI && (state.nonInteractiveApproval === "deny" || state.defaulted === true);
+	if (approvalMode === "auto" && unattendedRefused) {
+		approvalMode = "confirm";
+		nonInteractiveApproval = "deny";
+	}
+	const policy: StepChildPermissionPolicy = {
+		approvalMode,
+		nonInteractiveApproval,
+		autoResume: normalizeAutoResume(approvalMode, nonInteractiveApproval, state.autoResume),
+	};
+	if (state.toolOverrides && Object.keys(state.toolOverrides).length > 0) {
+		policy.toolOverrides = cloneToolOverrides({ ...state.toolOverrides });
+	}
+	return policy;
+}
+
+/**
+ * Extension event-bus channel the subagent tool uses to read the Step
+ * extension's live permission state at execution time. The payload carries a
+ * `reply` callback; the bus dispatches synchronously, so the answer is in
+ * before `emit` returns.
+ */
+export const STEP_PERMISSION_STATE_REQUEST = "step:permission-state-request";
+
+interface StepPermissionStateRequest {
+	reply(state: StepPermissionState): void;
+}
+
+/**
+ * Answer permission-state requests on `events` with the current live state.
+ * `events` is optional only for partial hosts and test doubles without a bus.
+ */
+export function answerStepPermissionStateRequests(
+	events: EventBus | undefined,
+	getState: () => StepPermissionState,
+): () => void {
+	if (!events) return () => {};
+	return events.on(STEP_PERMISSION_STATE_REQUEST, (data) => {
+		const request = data as Partial<StepPermissionStateRequest> | undefined;
+		if (typeof request?.reply === "function") request.reply(getState());
+	});
+}
+
+/** Read the Step extension's live permission state; undefined when it is not loaded. */
+export function requestStepPermissionState(events: EventBus | undefined): StepPermissionState | undefined {
+	if (!events) return undefined;
+	let state: StepPermissionState | undefined;
+	events.emit(STEP_PERMISSION_STATE_REQUEST, {
+		reply: (value) => {
+			state = value;
+		},
+	} satisfies StepPermissionStateRequest);
+	return state;
 }
 
 /**

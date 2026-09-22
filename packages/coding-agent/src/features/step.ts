@@ -13,6 +13,7 @@ import { STEP_INIT_PROMPT } from "../step/init-prompt.ts";
 import { createStepMcpExtension } from "../step/mcp.ts";
 import {
 	AUTO_RESUME_PROMPT,
+	answerStepPermissionStateRequests,
 	getStepPermissionPreset,
 	publishStepPermissionStatus,
 	StepAutoResumeController,
@@ -123,6 +124,10 @@ export function createStepExtension(options: StepExtensionOptions = {}): Extensi
 			recordStepSlashCommand(options.telemetry, token, builtInSlashCommands.has(name));
 		});
 		let permissions = new StepPermissionController(resolvePermissionOptions(options));
+		// The subagent tool reads the live policy here when it spawns a child, so
+		// the child gets the parent's effective policy rather than re-resolving
+		// its own from env and settings.
+		answerStepPermissionStateRequests(pi.events, () => permissions.getState());
 		let notify: ((message: string, type?: "info" | "warning" | "error") => void) | undefined;
 		let autoResumeAllowed = false;
 		let nativeRetryPreference: boolean | undefined;

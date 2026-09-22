@@ -11,6 +11,7 @@ import path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@step-harness/agent-core";
 import type { Static } from "typebox";
 import type { ExtensionContext } from "../../core/extensions/types.ts";
+import { resolveStepChildPermissionPolicy, type StepPermissionState } from "../../step/permissions.ts";
 import { type StepTelemetryReporter, trackStepTelemetry } from "../../step/telemetry.ts";
 import {
 	cloneUsage,
@@ -224,6 +225,8 @@ export async function executeSubagent(
 		worktreeManager: StepWorktreeManager;
 		runner: StepSubagentRunner;
 		telemetry?: StepTelemetryReporter;
+		/** The parent's live permission state; undefined when no Step controller is loaded. */
+		permissionState?: () => StepPermissionState | undefined;
 	},
 	laneRuntime?: StepSubagentLaneRuntime,
 ): Promise<AgentToolResult<StepSubagentDetails>> {
@@ -336,12 +339,15 @@ export async function executeSubagent(
 				});
 				emit(parallel ? "parallel" : "single");
 			};
+			// Read at spawn time: a preset switched mid-session applies to the next child.
+			const permissionState = options.permissionState?.();
 			const child = await options.runner({
 				agent,
 				task: task.task,
 				cwd: childCwd,
 				model: task.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
 				thinkingLevel: ctx.thinkingLevel,
+				...(permissionState ? { permission: resolveStepChildPermissionPolicy(permissionState, ctx.hasUI) } : {}),
 				signal,
 				onUpdate: update,
 				onNeedsInput: laneRuntime?.onNeedsInput,

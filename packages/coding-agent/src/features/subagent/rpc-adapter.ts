@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isValidThinkingLevel } from "../../cli/args.ts";
 import {
 	CHILD_MARKER,
 	cloneUsage,
@@ -101,6 +102,8 @@ interface SubagentRpcTurn {
 /** A live `--mode rpc` child bound to one subagent session id. */
 export interface StepSubagentRpcSession {
 	readonly sessionId: string;
+	/** `subagentPermissionKey` of the policy this child was spawned with. */
+	readonly permissionKey: string;
 	/** True while the child can still accept stdin commands. */
 	isAlive(): boolean;
 	/** True while a prompt turn is in flight. */
@@ -177,7 +180,53 @@ export function buildSubagentChildEnv(input: StepSubagentRunInput): NodeJS.Proce
 		...(input.workflowAcl
 			? { [WORKFLOW_ACL_ENV]: JSON.stringify(input.workflowAcl) }
 			: { [WORKFLOW_ACL_ENV]: undefined }),
+		// Auto-resume has no CLI flag. Pin it here so neither an inherited
+		// `STEP_AUTOPILOT` nor a persisted setting overrides the parent's choice.
+		...(input.permission
+			? { STEP_AUTOPILOT: undefined, STEP_AUTO_RESUME: input.permission.autoResume ? "1" : "0" }
+			: {}),
 	};
+}
+
+/** Comparable identity of a child's permission policy: the flags it is spawned with. */
+export function subagentPermissionKey(policy: StepSubagentRunInput["permission"]): string {
+	return JSON.stringify([...permissionArgs(policy), policy?.autoResume === true]);
+}
+
+function permissionArgs(policy: StepSubagentRunInput["permission"]): string[] {
+	if (!policy) return [];
+	const args = ["--approval-mode", policy.approvalMode, "--non-interactive-approval", policy.nonInteractiveApproval];
+	for (const [tool, mode] of Object.entries(policy.toolOverrides ?? {})) {
+		args.push("--tool-override", `${tool}=${mode}`);
+	}
+	return args;
+}
+
+/** True when a model pattern ends in a `:<thinking level>` suffix. */
+function declaresThinkingLevel(model: string): boolean {
+	const colon = model.lastIndexOf(":");
+	return colon !== -1 && isValidThinkingLevel(model.slice(colon + 1));
+}
+
+/**
+ * Argv for one rpc child, minus the `--append-system-prompt` temp file.
+ *
+ * The child inherits the parent's thinking level unless its model pattern
+ * declares one (`provider/id:high`): an explicit `--thinking` would override
+ * that suffix in the child's resolver. A model without reasoning support
+ * clamps the level instead of failing. The permission policy goes as explicit
+ * flags, which outrank any `STEP_*` env var or persisted preset the child
+ * would otherwise resolve.
+ */
+export function buildSubagentChildArgs(input: StepSubagentRunInput, sessionId: string): string[] {
+	const args = ["--mode", "rpc", "--session-id", sessionId];
+	const model = input.agent.model ?? input.model;
+	if (model) args.push("--model", model);
+	if (input.thinkingLevel && !(model && declaresThinkingLevel(model))) args.push("--thinking", input.thinkingLevel);
+	const tools = normalizeChildTools(input.agent.tools);
+	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
+	args.push(...permissionArgs(input.permission));
+	return args;
 }
 
 /** Spawn a long-running `--mode rpc --session-id` child for one subagent session. */
@@ -186,12 +235,7 @@ export async function createSubagentRpcSession(
 	sessionId: string,
 ): Promise<StepSubagentRpcSession> {
 	const tempDir = await mkdtemp(path.join(os.tmpdir(), "stepcode-subagent-"));
-	const args = ["--mode", "rpc", "--session-id", sessionId];
-	const model = input.agent.model ?? input.model;
-	if (model) args.push("--model", model);
-	if (input.thinkingLevel && !input.agent.model) args.push("--thinking", input.thinkingLevel);
-	const tools = normalizeChildTools(input.agent.tools);
-	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
+	const args = buildSubagentChildArgs(input, sessionId);
 	if (input.agent.systemPrompt.trim()) {
 		const promptPath = path.join(tempDir, "system-prompt.md");
 		await writeFile(promptPath, input.agent.systemPrompt, { encoding: "utf8", mode: 0o600 });
@@ -485,6 +529,7 @@ export async function createSubagentRpcSession(
 
 	const handle: StepSubagentRpcSession = {
 		sessionId,
+		permissionKey: subagentPermissionKey(input.permission),
 		isAlive: () => !childExited && !stdinEnded,
 		isTurnActive: () => turn !== undefined,
 		send,

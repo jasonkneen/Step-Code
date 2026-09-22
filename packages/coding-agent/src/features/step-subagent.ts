@@ -16,6 +16,7 @@ import { type Static, Type } from "typebox";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import type { ExtensionAPI, ExtensionContext, ExtensionFactory, InlineExtension } from "../core/extensions/types.ts";
 import { resolveStepAgentDir, resolveStepConfigDir } from "../step/environment.ts";
+import { requestStepPermissionState, type StepChildPermissionPolicy } from "../step/permissions.ts";
 import type { StepTelemetryReporter } from "../step/telemetry.ts";
 import { formatBuiltinAgentGuidance, type StepAgentConfig, type StepAgentScope } from "./step-subagent-agents.ts";
 import { executeSubagent } from "./subagent/execute.ts";
@@ -33,7 +34,7 @@ import {
 	SubagentListWidget,
 	subagentListSignature,
 } from "./subagent/rendering.ts";
-import { createSubagentRpcSession } from "./subagent/rpc-adapter.ts";
+import { createSubagentRpcSession, subagentPermissionKey } from "./subagent/rpc-adapter.ts";
 
 // Lane-notification primitives moved to ./subagent/lane-events.ts; re-exported
 // here to keep this module's public surface stable.
@@ -129,6 +130,12 @@ export interface StepSubagentRunInput {
 	 * Defaults to `resolveSubagentTurnIdleTimeoutMs()`; `0` disables the watchdog.
 	 */
 	turnIdleTimeoutMs?: number;
+	/**
+	 * The parent's permission policy, passed to the child as explicit flags so
+	 * the child is never more permissive than the parent. Omitted when the
+	 * parent has no Step permission controller; the child then resolves its own.
+	 */
+	permission?: StepChildPermissionPolicy;
 	/** Workflow-owned path ACL passed to the child-side tool_call hook. */
 	workflowAcl?: {
 		baseCwd: string;
@@ -404,7 +411,15 @@ const spawnedSubagentSessions = new Set<string>();
 export async function runStepSubagentProcess(input: StepSubagentRunInput): Promise<StepSubagentRunResult> {
 	const sessionId = input.sessionId?.trim() || `${SUBAGENT_SESSION_ID_PREFIX}${randomUUID()}`;
 	const live = getLiveSubagentSession(sessionId);
-	if (live) return live.runTurn(input);
+	if (live) {
+		if (live.isTurnActive() || live.permissionKey === subagentPermissionKey(input.permission)) {
+			return live.runTurn(input);
+		}
+		// A live child keeps the policy it was spawned with. The parent's changed
+		// since (e.g. tightened via /permissions), so replace the idle child and
+		// resume its transcript under the current policy.
+		live.stop();
+	}
 	if (spawnedSubagentSessions.has(sessionId)) input.onChildRespawn?.();
 	spawnedSubagentSessions.add(sessionId);
 	const session = await createSubagentRpcSession(input, sessionId);
@@ -517,6 +532,9 @@ export function createStepSubagentExtension(options: StepSubagentExtensionOption
 		// tool profile, but does not recursively expose another subagent tool.
 		if (process.env[CHILD_MARKER] === "1") return;
 
+		// Read the parent's live permission state at each spawn, so a preset
+		// switched mid-session reaches the next child.
+		const run = { ...resolved, permissionState: () => requestStepPermissionState(pi.events) };
 		const lanes = new Map<string, BackgroundAgentLane>();
 		const laneWidgetKey = (id: string): string => `step-agent:${id}`;
 		const updateLaneWidget = (lane: BackgroundAgentLane): void => {
@@ -534,7 +552,7 @@ export function createStepSubagentExtension(options: StepSubagentExtensionOption
 			lanes,
 			agentDir: resolved.agentDir,
 			executeSubagent: (runParams, signal, onUpdate, ctx, laneRuntime) =>
-				executeSubagent(runParams, signal, onUpdate, ctx, resolved, laneRuntime),
+				executeSubagent(runParams, signal, onUpdate, ctx, run, laneRuntime),
 			updateLaneWidget,
 		});
 
@@ -565,7 +583,7 @@ export function createStepSubagentExtension(options: StepSubagentExtensionOption
 					// normal validation result keeps the error attached to this tool call
 					// instead of emitting a misleading background_done notification.
 					if (Number(hasSingleInput) + Number(hasParallelInput) + Number(hasChainInput) !== 1) {
-						return executeSubagent(backgroundParams, signal, onUpdate, ctx, resolved);
+						return executeSubagent(backgroundParams, signal, onUpdate, ctx, run);
 					}
 					const lane = createLane(backgroundParams, ctx);
 					startLane(lane, backgroundParams);
@@ -583,7 +601,7 @@ export function createStepSubagentExtension(options: StepSubagentExtensionOption
 					);
 				}
 				return withSubagentListWidget(toolCallId, ctx, onUpdate, (update) =>
-					executeSubagent(params as SubagentParams, signal, update, ctx, resolved),
+					executeSubagent(params as SubagentParams, signal, update, ctx, run),
 				);
 			},
 			renderCall: (params, theme) => {
