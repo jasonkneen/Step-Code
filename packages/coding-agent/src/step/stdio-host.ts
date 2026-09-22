@@ -110,6 +110,8 @@ interface ActiveQuery {
 	interrupted: boolean;
 	errorMessage?: string;
 	finished: boolean;
+	/** Set when an `agent_end` for this query reported `reason: "max_turns"`. */
+	maxTurnsReached?: boolean;
 }
 
 interface PendingRequest {
@@ -659,20 +661,26 @@ export class StepStdioHost {
 		if (query.finished) return;
 		query.finished = true;
 		const text = this.#session.getLastAssistantText() ?? "";
+		// Hitting the turn cap is a distinct terminal state: it must never report
+		// as "success", even though nothing errored and the query wasn't interrupted.
+		const maxTurnsReached = query.maxTurnsReached === true;
+		const effectiveIsError = isError || maxTurnsReached;
 		this.#emitMessage(query, {
 			type: "result",
-			subtype: isError ? "error_during_execution" : "success",
+			subtype: maxTurnsReached ? "error_max_turns" : effectiveIsError ? "error_during_execution" : "success",
 			session_id: query.sessionId,
 			duration_ms: Date.now() - query.startedAt,
 			duration_api_ms: Date.now() - query.startedAt,
-			is_error: isError,
+			is_error: effectiveIsError,
 			num_turns: query.numTurns,
-			...(isError
+			...(effectiveIsError
 				? {
 						errors: [
 							cause instanceof Error
 								? cause.message
-								: (query.errorMessage ?? (query.interrupted ? "Interrupted" : "Agent execution failed")),
+								: maxTurnsReached
+									? "Reached the maxTurns limit for this query."
+									: (query.errorMessage ?? (query.interrupted ? "Interrupted" : "Agent execution failed")),
 						],
 					}
 				: { result: text }),
@@ -692,6 +700,10 @@ export class StepStdioHost {
 		const previousTools = agent.state.tools;
 		const previousBeforeToolCall = agent.beforeToolCall;
 		const previousAfterToolCall = agent.afterToolCall;
+		const previousMaxTurns = agent.maxTurns;
+		if (typeof query.options.maxTurns === "number") {
+			agent.maxTurns = query.options.maxTurns;
+		}
 		const sdkTools = (query.options.sdkTools ?? []).map((descriptor) => this.#createSdkTool(query, descriptor));
 		const existingNames = new Set(previousTools.map((tool) => tool.name));
 		const acceptedTools = sdkTools.filter((tool) => {
@@ -753,6 +765,7 @@ export class StepStdioHost {
 			agent.state.tools = previousTools;
 			agent.beforeToolCall = previousBeforeToolCall;
 			agent.afterToolCall = previousAfterToolCall;
+			agent.maxTurns = previousMaxTurns;
 		};
 	}
 
@@ -1079,6 +1092,8 @@ export class StepStdioHost {
 					],
 				},
 			});
+		} else if (event.type === "agent_end") {
+			if (event.reason === "max_turns") query.maxTurnsReached = true;
 		} else if (event.type === "agent_settled") {
 			this.#maybeFinish(query);
 		}
@@ -1389,6 +1404,7 @@ function normalizeQueryOptions(value: unknown): StepQueryOptions {
 			: {}),
 		...(typeof options.model === "string" ? { model: options.model } : {}),
 		...(typeof options.maxThinkingTokens === "number" ? { maxThinkingTokens: options.maxThinkingTokens } : {}),
+		...(typeof options.maxTurns === "number" ? { maxTurns: options.maxTurns } : {}),
 		...(Array.isArray(options.sdkTools)
 			? {
 					sdkTools: options.sdkTools.filter(isSdkToolDescriptor),
@@ -1431,9 +1447,6 @@ function collectOptionWarnings(options: StepQueryOptions): string[] {
 	}
 	if (options.appendSystemPrompt !== undefined) {
 		warnings.push("appendSystemPrompt is not supported for an already-created Step session.");
-	}
-	if (options.maxTurns !== undefined) {
-		warnings.push("maxTurns is not enforced by this adapter; Step's configured agent loop limit remains active.");
 	}
 	if (options.permissionMode === "bypassPermissions") {
 		warnings.push(

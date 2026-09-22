@@ -251,6 +251,13 @@ export function createStepExtension(options: StepExtensionOptions = {}): Extensi
 		});
 
 		pi.on("agent_end", (event) => {
+			if (event.reason === "max_turns") {
+				try {
+					notify?.("Stopped: reached the maxTurnsPerPrompt limit for this prompt.", "warning");
+				} catch {
+					// The UI may have been torn down while this event was in flight.
+				}
+			}
 			autoResume.handleAgentEnd(event);
 		});
 		pi.on("agent_settled", (_event, ctx) => {

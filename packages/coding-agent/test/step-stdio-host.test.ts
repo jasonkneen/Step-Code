@@ -258,6 +258,114 @@ describe("StepStdioHost", () => {
 		await running;
 	});
 
+	test("honors query.start options.maxTurns by setting it on the Pi agent, without an unenforced warning", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const decoder = new StepStdioFrameDecoder();
+		const frames: ReturnType<StepStdioFrameDecoder["push"]> = [];
+		output.on("data", (chunk: Buffer) => frames.push(...decoder.push(chunk)));
+		const waitFor = async (predicate: () => boolean): Promise<void> => {
+			const deadline = Date.now() + 1_000;
+			while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(predicate()).toBe(true);
+		};
+		const { runtime, session } = createFakeRuntime(true);
+		const host = new StepStdioHost({ runtimeHost: runtime, input, output });
+		const running = host.run();
+		const envelope = (id: string, method: string, payload: unknown): Buffer =>
+			encodeStepStdioFrame({
+				protocol: "step-agent-sdk",
+				version: 1,
+				kind: "request",
+				id,
+				method,
+				payload,
+			});
+
+		input.write(envelope("init", "initialize", { protocolRange: { min: 1, max: 1 } }));
+		await waitFor(() => frames.some((frame) => frame.kind === "response" && frame.replyTo === "init"));
+		input.write(
+			envelope("query", "query.start", {
+				streamingInput: true,
+				options: { maxTurns: 5 },
+			}),
+		);
+		await waitFor(() => frames.some((frame) => frame.kind === "response" && frame.replyTo === "query"));
+
+		const agent = (session as unknown as { agent: { maxTurns?: number } }).agent;
+		expect(agent.maxTurns).toBe(5);
+
+		const initEvent = frames.find(
+			(frame) =>
+				frame.kind === "event" && (frame.payload as { message?: { subtype?: string } }).message?.subtype === "init",
+		);
+		const warnings = (initEvent?.payload as { message?: { warnings?: string[] } }).message?.warnings ?? [];
+		expect(warnings.some((warning) => warning.includes("maxTurns"))).toBe(false);
+
+		// The override is scoped to this query, not persisted on the session.
+		input.write(envelope("input-end", "query.input_end", {}));
+		await waitFor(() =>
+			frames.some(
+				(frame) =>
+					frame.kind === "event" && (frame.payload as { message?: { type?: string } }).message?.type === "result",
+			),
+		);
+		expect(agent.maxTurns).toBeUndefined();
+
+		await host.close();
+		await running;
+	});
+
+	test("reports a max_turns agent_end as a distinct, non-success result", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const decoder = new StepStdioFrameDecoder();
+		const frames: ReturnType<StepStdioFrameDecoder["push"]> = [];
+		output.on("data", (chunk: Buffer) => frames.push(...decoder.push(chunk)));
+		const waitFor = async (predicate: () => boolean): Promise<void> => {
+			const deadline = Date.now() + 1_000;
+			while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+			expect(predicate()).toBe(true);
+		};
+		const { runtime, emit } = createFakeRuntime();
+		const host = new StepStdioHost({ runtimeHost: runtime, input, output });
+		const running = host.run();
+		const envelope = (id: string, method: string, payload: unknown): Buffer =>
+			encodeStepStdioFrame({
+				protocol: "step-agent-sdk",
+				version: 1,
+				kind: "request",
+				id,
+				method,
+				payload,
+			});
+
+		input.write(envelope("init", "initialize", { protocolRange: { min: 1, max: 1 } }));
+		await waitFor(() => frames.some((frame) => frame.kind === "response" && frame.replyTo === "init"));
+		input.write(envelope("query", "query.start", { streamingInput: true }));
+		await waitFor(() => frames.some((frame) => frame.kind === "response" && frame.replyTo === "query"));
+
+		// Simulate the agent loop hitting its turn cap: never treated as "completed".
+		emit({ type: "agent_end", messages: [], willRetry: false, reason: "max_turns" } as unknown as AgentSessionEvent);
+		input.write(envelope("input-end", "query.input_end", {}));
+		await waitFor(() =>
+			frames.some(
+				(frame) =>
+					frame.kind === "event" && (frame.payload as { message?: { type?: string } }).message?.type === "result",
+			),
+		);
+		const result = frames.find(
+			(frame) =>
+				frame.kind === "event" && (frame.payload as { message?: { type?: string } }).message?.type === "result",
+		);
+		expect(result?.payload).toMatchObject({
+			message: { type: "result", subtype: "error_max_turns", is_error: true },
+		});
+
+		await host.close();
+		await running;
+	});
+
 	test("bridges SDK tools through the Pi agent and preserves the result", async () => {
 		const input = new PassThrough();
 		const output = new PassThrough();

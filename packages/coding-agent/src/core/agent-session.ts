@@ -150,6 +150,8 @@ export type AgentSessionEvent =
 			type: "agent_end";
 			messages: AgentMessage[];
 			willRetry: boolean;
+			/** Set when the loop stopped because it hit its configured turn cap rather than finishing normally. */
+			reason?: "max_turns";
 	  }
 	| { type: "agent_settled" }
 	| {
@@ -843,7 +845,7 @@ export class AgentSession {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
-			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages, reason: event.reason });
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -1258,8 +1260,10 @@ export class AgentSession {
 			return true;
 		}
 
-		// The agent loop drains both queues before emitting agent_end. Any messages
-		// here were queued by agent_end extension handlers and need a continuation.
+		// The agent loop drains both queues before emitting agent_end, unless it
+		// stopped because it hit maxTurns - that path deliberately leaves an
+		// already-queued message queued instead of draining it. Either way, any
+		// messages left here need a continuation (a fresh maxTurns budget).
 		return this.agent.hasQueuedMessages();
 	}
 

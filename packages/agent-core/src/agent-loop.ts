@@ -164,6 +164,9 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	// Counts assistant turns (LLM calls) started across this entire run, including
+	// turns triggered by follow-up messages in the outer loop below.
+	let turnCount = 0;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -173,6 +176,8 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			turnCount++;
+
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
@@ -264,6 +269,21 @@ async function runLoop(
 
 			if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
 				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
+			// Undefined/0 means unlimited. Check here - after the turn's tool results
+			// are appended and turn_end has fired, but before the steering queue is
+			// drained - so nothing is left dangling and no queued message is silently
+			// discarded (it stays queued for the next run). Only report "max_turns" as
+			// the reason when the model still had more to do; if it had already
+			// stopped on its own this turn, that is a normal completion.
+			if (config.maxTurns && config.maxTurns > 0 && turnCount >= config.maxTurns) {
+				await emit({
+					type: "agent_end",
+					messages: newMessages,
+					...(hasMoreToolCalls ? { reason: "max_turns" as const } : {}),
+				});
 				return;
 			}
 

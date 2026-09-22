@@ -411,6 +411,23 @@ describe("Step autopilot continuation", () => {
 		});
 	});
 
+	it("does not treat a max_turns stop as a resumable failure, even if the last assistant message errored", () => {
+		const setTimer = vi.fn(() => 1 as unknown as ReturnType<typeof setTimeout>);
+		const controller = new StepAutoResumeController({
+			isEnabled: () => true,
+			canResume: () => true,
+			resume: vi.fn(),
+			setTimer,
+		});
+		controller.handleAgentEnd({
+			type: "agent_end",
+			reason: "max_turns",
+			messages: [{ role: "assistant", stopReason: "error", errorMessage: "network down" }],
+		} as never);
+		controller.handleAgentSettled();
+		expect(setTimer).not.toHaveBeenCalled();
+	});
+
 	it("does not schedule when disabled or when the run has pending work", () => {
 		const setTimer = vi.fn(() => 1 as unknown as ReturnType<typeof setTimeout>);
 		const controller = new StepAutoResumeController({

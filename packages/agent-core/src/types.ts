@@ -162,6 +162,25 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolCallLeakRetries?: number;
 
 	/**
+	 * Bounds the number of assistant turns (LLM calls) started within a single
+	 * `agentLoop`/`agentLoopContinue` run (a "run" spans the outer follow-up-message
+	 * loop, not just one prompt/continue call).
+	 *
+	 * When the limit is reached, the loop stops instead of starting another LLM
+	 * call. The last completed turn's tool results are always fully appended to
+	 * the transcript first, so no tool call is ever left dangling, and any
+	 * already-queued steering/follow-up messages are left queued rather than
+	 * drained, so they are not silently dropped.
+	 *
+	 * `agent_end` carries `reason: "max_turns"` only when the model still had
+	 * more tool calls to make on that final turn. If it happened to stop on its
+	 * own right at the limit, that is a normal completion and `reason` is omitted.
+	 *
+	 * Undefined or 0 means unlimited (the library default).
+	 */
+	maxTurns?: number;
+
+	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
 	 *
 	 * Each AgentMessage must be converted to a UserMessage, AssistantMessage, or ToolResultMessage
@@ -441,7 +460,7 @@ export interface AgentContext {
 export type AgentEvent =
 	// Agent lifecycle
 	| { type: "agent_start" }
-	| { type: "agent_end"; messages: AgentMessage[] }
+	| { type: "agent_end"; messages: AgentMessage[]; reason?: "max_turns" }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }

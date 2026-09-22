@@ -686,6 +686,13 @@ export class StepAutoResumeController {
 	}
 
 	handleAgentEnd(event: AgentEndEvent): void {
+		// Hitting the configured turn cap is a bounded-loop safeguard, not a
+		// transient model/transport failure - resuming would just run the same
+		// stuck loop for another maxTurns turns. Treat it like a clean stop.
+		if (event.reason === "max_turns") {
+			this.reset();
+			return;
+		}
 		const failure = describeAssistantFailure(event.messages);
 		if (!failure) {
 			this.reset();

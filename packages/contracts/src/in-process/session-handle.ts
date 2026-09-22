@@ -40,7 +40,7 @@ export interface AgentMessagePreview {
  */
 export type AgentEvent =
 	| { readonly type: "agent_start" }
-	| { readonly type: "agent_end"; readonly willRetry: boolean }
+	| { readonly type: "agent_end"; readonly willRetry: boolean; readonly reason?: "max_turns" }
 	| { readonly type: "agent_settled" }
 	| { readonly type: "turn_start" }
 	| { readonly type: "turn_end"; readonly message: AgentMessagePreview }

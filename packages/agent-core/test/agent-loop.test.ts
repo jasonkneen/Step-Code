@@ -1730,3 +1730,184 @@ describe("tool-call markup leak retry", () => {
 		expect(calls()).toBe(2);
 	});
 });
+
+describe("maxTurns", () => {
+	const toolSchema = Type.Object({ value: Type.String() });
+
+	function createLoopingTool(executed: string[]): AgentTool<typeof toolSchema, { value: string }> {
+		return {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return { content: [{ type: "text", text: `echoed: ${params.value}` }], details: params };
+			},
+		};
+	}
+
+	/** A faux model that always responds with a tool call, never stopping on its own. */
+	function alwaysToolCallStream() {
+		let call = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const index = call++;
+			queueMicrotask(() => {
+				const message = createAssistantMessage(
+					[{ type: "toolCall", id: `tool-${index}`, name: "echo", arguments: { value: `call-${index}` } }],
+					"toolUse",
+				);
+				stream.push({ type: "done", reason: "toolUse", message });
+			});
+			return stream;
+		};
+		return { streamFn, calls: () => call };
+	}
+
+	it("stops after exactly maxTurns assistant messages with reason 'max_turns' and no dangling tool calls", async () => {
+		const executed: string[] = [];
+		const tool = createLoopingTool(executed);
+		const { streamFn, calls } = alwaysToolCallStream();
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter, maxTurns: 3 };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		// Exactly 3 assistant messages were produced - the model was never asked for a 4th.
+		expect(calls()).toBe(3);
+		const assistantMessages = messages.filter((m) => m.role === "assistant");
+		expect(assistantMessages.length).toBe(3);
+
+		// Every tool call has a matching tool result; none is left dangling.
+		const toolCallIds = assistantMessages.flatMap((m) =>
+			(m as AssistantMessage).content.filter((c) => c.type === "toolCall").map((c) => c.id),
+		);
+		const toolResultIds = messages
+			.filter((m) => m.role === "toolResult")
+			.map((m) => (m as { toolCallId: string }).toolCallId);
+		expect(toolCallIds.sort()).toEqual(toolResultIds.sort());
+		expect(toolCallIds.length).toBe(3);
+
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect(agentEnd).toBeDefined();
+		expect((agentEnd as { reason?: string }).reason).toBe("max_turns");
+	});
+
+	it("runs unlimited turns when maxTurns is unset", async () => {
+		const executed: string[] = [];
+		const tool = createLoopingTool(executed);
+		let call = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const index = call++;
+			queueMicrotask(() => {
+				if (index < 5) {
+					const message = createAssistantMessage(
+						[{ type: "toolCall", id: `tool-${index}`, name: "echo", arguments: { value: `call-${index}` } }],
+						"toolUse",
+					);
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(call).toBe(6);
+		expect(messages.filter((m) => m.role === "assistant").length).toBe(6);
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect((agentEnd as { reason?: string }).reason).toBeUndefined();
+	});
+
+	it("does not report 'max_turns' when the model stops on its own on the capped turn", async () => {
+		const executed: string[] = [];
+		const tool = createLoopingTool(executed);
+		let call = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const index = call++;
+			queueMicrotask(() => {
+				if (index < 2) {
+					const message = createAssistantMessage(
+						[{ type: "toolCall", id: `tool-${index}`, name: "echo", arguments: { value: `call-${index}` } }],
+						"toolUse",
+					);
+					stream.push({ type: "done", reason: "toolUse", message });
+				} else {
+					// Third turn stops naturally, exactly on the maxTurns boundary.
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					stream.push({ type: "done", reason: "stop", message });
+				}
+			});
+			return stream;
+		};
+
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter, maxTurns: 3 };
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const messages = await stream.result();
+
+		expect(call).toBe(3);
+		expect(messages.filter((m) => m.role === "assistant").length).toBe(3);
+		const agentEnd = events.find((e) => e.type === "agent_end");
+		expect((agentEnd as { reason?: string }).reason).toBeUndefined();
+	});
+
+	it("does not drain queued steering messages once the turn cap is reached", async () => {
+		const executed: string[] = [];
+		const tool = createLoopingTool(executed);
+		const { streamFn } = alwaysToolCallStream();
+
+		let steeringCalls = 0;
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			maxTurns: 3,
+			// Always empty: this test cares about *when* the queue is polled, not
+			// about delivering a message.
+			getSteeringMessages: async () => {
+				steeringCalls++;
+				return [];
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// drain
+		}
+		const messages = await stream.result();
+
+		expect(messages.filter((m) => m.role === "user").length).toBe(1);
+		// One poll before the run starts, plus one at the start and one at the end
+		// of each of the 3 permitted turns, minus the trailing poll after the
+		// last turn (turn 3) - the loop returns for the max_turns cap before
+		// reaching it. A message queued at that point must stay queued for the
+		// next run instead of being silently dropped, so there must be no 6th call.
+		expect(steeringCalls).toBe(5);
+	});
+});

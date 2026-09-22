@@ -11,6 +11,9 @@ import { stripBom } from "../utils/text.ts";
 import type { ContextProjectionMode } from "./compaction/projection.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
+/** Default cap on assistant turns (LLM calls) per prompt/continue run. 0 disables the cap. */
+export const DEFAULT_MAX_TURNS_PER_PROMPT = 200;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -145,6 +148,7 @@ export interface Settings {
 	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular TUI mode
 	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular TUI mode
 	fullscreenCopyOnSelect?: boolean; // default: true; no effect in regular TUI mode
+	maxTurnsPerPrompt?: number; // Max assistant turns (LLM calls) per prompt/continue run; default 200, 0 disables
 }
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
@@ -923,6 +927,19 @@ export class SettingsManager {
 		}
 		this.globalSettings.httpIdleTimeoutMs = Math.floor(timeoutMs);
 		this.markModified("httpIdleTimeoutMs");
+		this.save();
+	}
+
+	getMaxTurnsPerPrompt(): number {
+		return this.settings.maxTurnsPerPrompt ?? DEFAULT_MAX_TURNS_PER_PROMPT;
+	}
+
+	setMaxTurnsPerPrompt(maxTurns: number): void {
+		if (!Number.isFinite(maxTurns) || maxTurns < 0) {
+			throw new Error(`Invalid maxTurnsPerPrompt setting: ${String(maxTurns)}`);
+		}
+		this.globalSettings.maxTurnsPerPrompt = Math.floor(maxTurns);
+		this.markModified("maxTurnsPerPrompt");
 		this.save();
 	}
 

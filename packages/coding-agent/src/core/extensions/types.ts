@@ -781,6 +781,8 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/** Set when the loop stopped because it hit its configured turn cap rather than finishing normally. */
+	reason?: "max_turns";
 }
 
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */

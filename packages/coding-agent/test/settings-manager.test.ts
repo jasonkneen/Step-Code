@@ -377,6 +377,33 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("maxTurnsPerPrompt", () => {
+		it("should default to 200", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getMaxTurnsPerPrompt()).toBe(200);
+		});
+
+		it("should use merged global and project settings", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ maxTurnsPerPrompt: 50 }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ maxTurnsPerPrompt: 0 }));
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getMaxTurnsPerPrompt()).toBe(0);
+		});
+
+		it("should persist a new value via the setter", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			manager.setMaxTurnsPerPrompt(10);
+			expect(manager.getMaxTurnsPerPrompt()).toBe(10);
+		});
+
+		it("should reject invalid values", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(() => manager.setMaxTurnsPerPrompt(-1)).toThrow("Invalid maxTurnsPerPrompt setting");
+		});
+	});
+
 	describe("externalEditor", () => {
 		const originalVisual = process.env.VISUAL;
 		const originalEditor = process.env.EDITOR;
