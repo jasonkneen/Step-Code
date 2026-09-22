@@ -650,6 +650,19 @@ async function prepareToolCall(
 		};
 	}
 
+	// The provider could not parse the final argument text as a complete JSON
+	// object. The salvaged arguments may validate while being silently truncated
+	// (e.g. a write whose content was cut off), so never execute them.
+	if (toolCall.argumentsError) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(
+				`Tool ${toolCall.name} was not executed because its arguments were incomplete or invalid JSON: ${toolCall.argumentsError}. Re-issue the tool call with complete arguments.`,
+			),
+			isError: true,
+		};
+	}
+
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
 		const validatedArgs = validateToolArguments(tool, preparedToolCall);

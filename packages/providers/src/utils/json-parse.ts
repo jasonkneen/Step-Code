@@ -122,3 +122,43 @@ export function parseStreamingJson<T = Record<string, unknown>>(partialJson: str
 		}
 	}
 }
+
+export interface ParsedToolCallArguments {
+	arguments: Record<string, any>;
+	/** Set when the complete argument text is not a JSON object. */
+	error?: string;
+}
+
+/**
+ * Strictly parses the complete argument text of a finished tool call.
+ *
+ * Unlike {@link parseStreamingJson}, a truncated or malformed payload is reported
+ * via `error` instead of being silently salvaged into executable arguments. The
+ * lenient salvage is still returned for display. Empty text is a valid no-arg call.
+ */
+export function parseToolCallArguments(json: string | undefined): ParsedToolCallArguments {
+	if (!json || json.trim() === "") {
+		return { arguments: {} };
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = parseJsonWithRepair<unknown>(json);
+	} catch (error) {
+		const salvaged = parseStreamingJson<unknown>(json);
+		return {
+			arguments: isPlainObject(salvaged) ? salvaged : {},
+			error: `Tool call arguments are incomplete or invalid JSON (${error instanceof Error ? error.message : String(error)})`,
+		};
+	}
+
+	if (!isPlainObject(parsed)) {
+		const kind = parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed;
+		return { arguments: {}, error: `Tool call arguments must be a JSON object, got ${kind}` };
+	}
+	return { arguments: parsed };
+}
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}

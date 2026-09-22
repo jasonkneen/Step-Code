@@ -207,4 +207,22 @@ describe("validateToolArguments", () => {
 			expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
 		}
 	});
+
+	it("throws instead of returning unvalidated non-object args for plain JSON schema tools", () => {
+		// Root coercion turns "5" into 5, which still fails the schema. The
+		// original (unvalidated) string must not be handed to the tool.
+		const tool: Tool = {
+			name: "echo",
+			description: "Echo tool",
+			parameters: { type: ["object", "integer"], minimum: 10 } as unknown as Tool["parameters"],
+		};
+		const toolCall = {
+			type: "toolCall",
+			id: "tool-1",
+			name: "echo",
+			arguments: "5",
+		} as unknown as ToolCall;
+
+		expect(() => validateToolArguments(tool, toolCall)).toThrow("Validation failed");
+	});
 });

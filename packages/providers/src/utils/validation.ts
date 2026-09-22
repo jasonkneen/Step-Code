@@ -328,8 +328,8 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): any {
 					delete args[key];
 				}
 				Object.assign(args, coerced);
-			} else {
-				return validator.Check(coerced) ? coerced : args;
+			} else if (validator.Check(coerced)) {
+				return coerced;
 			}
 		}
 	}
