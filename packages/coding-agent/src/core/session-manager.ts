@@ -6,11 +6,15 @@ import {
 	closeSync,
 	createReadStream,
 	existsSync,
+	fchmodSync,
+	fsyncSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -977,15 +981,45 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Rewrite the entire session file. Writes to a sibling temp file first and renames it
+	 * over the destination so a crash or exception mid-write cannot leave a truncated or
+	 * empty session file behind: the original file is untouched until the rename commits.
+	 */
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+
+		let existingMode: number | undefined;
 		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+			// Mask off the file-type bits (S_IFREG etc.) that statSync includes in `mode`;
+			// fchmodSync only wants the permission bits.
+			existingMode = statSync(this.sessionFile).mode & 0o777;
+		} catch {
+			// Destination doesn't exist yet (e.g. empty-file init); use default mode.
+		}
+
+		const tempPath = `${this.sessionFile}.${process.pid}.${randomUUID()}.tmp`;
+		try {
+			const fd = openSync(tempPath, "w");
+			try {
+				if (existingMode !== undefined) {
+					fchmodSync(fd, existingMode);
+				}
+				for (const entry of this.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				}
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
 			}
-		} finally {
-			closeSync(fd);
+			renameSync(tempPath, this.sessionFile);
+		} catch (error) {
+			try {
+				unlinkSync(tempPath);
+			} catch {
+				// Best-effort cleanup; the original error is what matters.
+			}
+			throw error;
 		}
 	}
 
