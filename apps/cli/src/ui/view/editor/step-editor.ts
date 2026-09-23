@@ -35,6 +35,37 @@ const STEP_EDITOR_CONTENT_INSET = "  ";
  */
 const STEP_EDITOR_PROMPT_MARKER = "❯ ";
 
+/**
+ * How long a keystroke that leaves the buffer empty suppresses the hint.
+ *
+ * The IME (pinyin, kana, ...) keeps the text it is composing in the terminal,
+ * not in the editor, so the buffer really is empty while a composition is in
+ * progress. The terminal paints that preedit over the cells the editor just
+ * wrote, and every keystroke makes the editor rewrite them with the hint. Both
+ * layers draw the same cell, so the hint and the composing text alternate:
+ * the flicker. Hiding the hint for the shortest window that covers the gaps
+ * between keystrokes keeps the terminal's cells to itself until the composition
+ * either commits into the buffer or is abandoned.
+ */
+const STEP_EDITOR_COMPOSING_HINT_SUPPRESS_MS = 500;
+
+/**
+ * Whether a keystroke is one the editor would insert text for.
+ *
+ * A printable keystroke that leaves the buffer empty was not consumed here, so
+ * the text it carried is still with the terminal. Anything that is not
+ * printable (arrows, Ctrl chords, Escape, function keys, paste frames) types
+ * nothing and must not open a suppression window.
+ */
+function isComposableKeystroke(data: string): boolean {
+	if (data.length === 0) return false;
+	for (const char of data) {
+		const code = char.codePointAt(0) ?? 0;
+		if (code < 32 || code === 0x7f) return false;
+	}
+	return true;
+}
+
 /** A frame this narrow is less useful than pi-tui's compact native editor. */
 const STEP_EDITOR_MIN_FRAME_WIDTH = 8;
 
@@ -96,6 +127,13 @@ export class StepEditor extends CustomEditor {
 	private keywordCount = 0;
 	private shimmerFrame = -1;
 	private shimmerTimer?: ReturnType<typeof setInterval>;
+	/**
+	 * Whether an in-progress composition is keeping the hint off the screen.
+	 * Only meaningful while the buffer is empty: with text in it the hint is
+	 * hidden anyway. See {@link STEP_EDITOR_COMPOSING_HINT_SUPPRESS_MS}.
+	 */
+	private hintSuppressed = false;
+	private hintRestoreTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(
 		tui: TUI,
@@ -147,12 +185,16 @@ export class StepEditor extends CustomEditor {
 	}
 
 	override handleInput(data: string): void {
+		this.noteCompositionKeystroke(data);
 		super.handleInput(data);
 		this.updateHighlights();
 	}
 
 	override setText(text: string): void {
 		super.setText(text);
+		// Only text disproves a composition. A programmatic clear can land
+		// between two keystrokes of one, so it leaves the window running.
+		if (text.length !== 0) this.clearHintSuppression();
 		this.updateHighlights();
 	}
 
@@ -160,6 +202,51 @@ export class StepEditor extends CustomEditor {
 		if (this.shimmerTimer) clearInterval(this.shimmerTimer);
 		this.shimmerTimer = undefined;
 		this.shimmerFrame = -1;
+	}
+
+	/**
+	 * Record a keystroke that arrived while the buffer was empty and carried
+	 * text the editor has not committed. That is the only composition evidence
+	 * available here: no terminal reports composition start/end to the
+	 * application, and the preedit an IME draws never reaches stdin, so the
+	 * buffer stays empty until the composition commits. Plain typing fills the
+	 * buffer on the first printable key, which ends the suppression by itself.
+	 */
+	private noteCompositionKeystroke(data: string): void {
+		if (this.getText().length !== 0) {
+			this.clearHintSuppression();
+			return;
+		}
+		if (!isComposableKeystroke(data)) return;
+		this.hintSuppressed = true;
+		// The window is the timer, not a clock comparison. Re-arming slides the
+		// deadline forward across the gaps between one composition's keystrokes.
+		this.scheduleHintRestore();
+	}
+
+	/**
+	 * Whether the empty composer should keep its hint out of the terminal's
+	 * way. A blurred editor never composes and cannot be repainted by the
+	 * restore timer, so it always shows its hint.
+	 */
+	private isHintSuppressed(): boolean {
+		return this.focused && this.hintSuppressed;
+	}
+
+	private clearHintSuppression(): void {
+		if (this.hintRestoreTimer) clearTimeout(this.hintRestoreTimer);
+		this.hintRestoreTimer = undefined;
+		this.hintSuppressed = false;
+	}
+
+	private scheduleHintRestore(): void {
+		if (this.hintRestoreTimer) clearTimeout(this.hintRestoreTimer);
+		this.hintRestoreTimer = setTimeout(() => {
+			this.hintRestoreTimer = undefined;
+			this.hintSuppressed = false;
+			if (this.focused) this.tui.requestRender();
+		}, STEP_EDITOR_COMPOSING_HINT_SUPPRESS_MS);
+		this.hintRestoreTimer.unref?.();
 	}
 
 	private updateHighlights(): void {
@@ -257,6 +344,11 @@ export class StepEditor extends CustomEditor {
 		const bashHint =
 			text === "!" ? STEP_BASH_PLACEHOLDER : text === "!!" ? STEP_BASH_EXCLUDED_PLACEHOLDER : undefined;
 		if ((text.length !== 0 && !bashHint) || lines.length < 2) {
+			return lines;
+		}
+		// An empty composer is the only row an in-progress composition can
+		// collide with; `!`/`!!` already holds typed text, so its hint stays.
+		if (!bashHint && this.isHintSuppressed()) {
 			return lines;
 		}
 

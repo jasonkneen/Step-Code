@@ -128,6 +128,85 @@ describe("StepEditor", () => {
 		for (const line of lines) expect(visibleWidth(line)).toBe(80);
 	});
 
+	it("hides the hint while an IME is composing into an empty composer", () => {
+		vi.useFakeTimers();
+		initTheme("step-blue");
+		const editor = createEditor();
+		editor.focused = true;
+		expect(editor.render(80)[1]).toContain(STEP_EDITOR_PLACEHOLDER);
+
+		// Pinyin: the terminal holds the preedit, so the buffer the editor sees
+		// stays empty while each keystroke repaints the region the hint was just
+		// written into. Re-arming on every keystroke keeps a whole composition
+		// covered rather than only its first stroke.
+		for (let index = 0; index < 6; index += 1) {
+			// Every keystroke of the composition reaches the editor with the
+			// buffer still empty: the preedit is the terminal's, so nothing the
+			// editor can see has been typed yet.
+			expect(editor.getText()).toBe("");
+			editor.handleInput("z");
+			editor.setText("");
+			vi.advanceTimersByTime(80);
+			expect(editor.render(80)[1]).not.toContain(STEP_EDITOR_PLACEHOLDER);
+		}
+
+		// Abandoning the composition restores the hint on a deadline, without
+		// waiting for unrelated input to trigger the next frame.
+		expect(editor.getText()).toBe("");
+		vi.advanceTimersByTime(500);
+		const restored = editor.render(80);
+		expect(restored[1]).toContain(STEP_EDITOR_PLACEHOLDER);
+		for (const line of restored) expect(visibleWidth(line)).toBe(80);
+	});
+
+	it("stops hiding the hint once composed text reaches the buffer", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		initTheme("step-blue");
+		const editor = createEditor();
+		editor.focused = true;
+
+		editor.handleInput("z");
+		expect(editor.render(80)[1]).not.toContain(STEP_EDITOR_PLACEHOLDER);
+		expect(editor.getText()).toBe("z");
+		// A commit or a programmatic fill is not a composition any more, so no
+		// suppressed state may outlive it.
+		editor.setText("这是拼音字符");
+		editor.setText("");
+		expect(editor.render(80)[1]).toContain(STEP_EDITOR_PLACEHOLDER);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("keeps the hint for keystrokes that compose nothing", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		initTheme("step-blue");
+		const editor = createEditor();
+		editor.focused = true;
+
+		// Arrows, Escape, and Ctrl chords type nothing, so they must not look
+		// like a composition starting.
+		for (const key of ["\x1b[D", "\x1b[A", "\x1b", "\x01"]) {
+			editor.handleInput(key);
+			vi.advanceTimersByTime(20);
+			expect(editor.render(80)[1]).toContain(STEP_EDITOR_PLACEHOLDER);
+		}
+	});
+
+	it("keeps the bash-mode hint while the prefix suppresses the idle hint", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		initTheme("step-blue");
+		const editor = createEditor();
+		editor.focused = true;
+		editor.handleInput("z");
+		editor.setText("!");
+
+		const lines = editor.render(80);
+		expect(lines[1]).toContain("run a shell command (Esc to exit)");
+		expect(lines[1]).not.toContain(STEP_EDITOR_PLACEHOLDER);
+	});
+
 	it("marks the first row and aligns wrapped rows to the same content column", () => {
 		initTheme("step-blue");
 		const editor = createEditor();
